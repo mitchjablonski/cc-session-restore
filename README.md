@@ -97,6 +97,10 @@ Only sessions you started yourself in a terminal are listed. SDK and background 
 - **Pre-checking is a best guess.** It relies on Claude Code cleaning up its own files. Uncheck anything you don't want.
 - **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested. The macOS, native Windows and other Linux terminal launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to test changes without opening real terminals, and [SECURITY.md](SECURITY.md) to report a security issue privately.
+
 ## License
 
 MIT
