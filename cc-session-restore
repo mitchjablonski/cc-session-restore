@@ -1,64 +1,120 @@
 #!/usr/bin/env python3
-"""cc-session-restore - reopen your Claude Code sessions after a restart (Windows + WSL).
+"""cc-session-restore - reopen your Claude Code sessions after a restart.
 
-Unofficial; not affiliated with Anthropic.
+Unofficial; not affiliated with Anthropic. Works on macOS, Linux, Windows and WSL.
 
-  cc-session-restore            list recent sessions, pick, open each in a Windows Terminal tab
-  cc-session-restore -n 25      show 25 sessions instead of 15
-  cc-session-restore list       just print the list
-  cc-session-restore -y         open the pre-checked sessions without asking
-  cc-session-restore --dry-run  print the launch commands instead of running them
-  cc-session-restore --json     machine-readable list (used by the GUI)
-  cc-session-restore --open ID [ID ...]   open these sessions (used by the GUI)
+  cc-session-restore              interactive picker in the terminal
+  cc-session-restore --gui        the same, as a page in your browser
+                                  (--no-browser just prints the URL; --port N picks the port)
+  cc-session-restore list         just print the list
+  cc-session-restore -y           reopen the pre-checked sessions without asking
+  cc-session-restore -n 30        show 30 sessions instead of 15
+  cc-session-restore --dry-run    print the launch commands instead of running them
+  cc-session-restore --terminal T open sessions with terminal T (see below)
+  cc-session-restore --install    add a "Claude Code sessions" launcher (Start menu / app menu)
+  cc-session-restore --json       machine-readable list
+  cc-session-restore --open ID... open these sessions by id
 
-How it knows what you had open, with no setup:
-  - Every session's transcript (~/.claude/projects/*/<id>.jsonl) is written on
+Terminals: wsl (Windows Terminal from WSL), windows-terminal, windows-console,
+tmux, iterm, macos-terminal, gnome-terminal, konsole, xfce4-terminal, kitty,
+wezterm, alacritty, x-terminal-emulator, xterm. Picked automatically; override
+with --terminal or CC_SESSION_RESTORE_TERMINAL.
+
+Environment:
+  CC_SESSION_RESTORE_TERMINAL     terminal to use (as above)
+  CC_SESSION_RESTORE_CLAUDE_ARGS  extra flags for every resumed session, e.g. "--model opus"
+  CC_SESSION_RESTORE_CLAUDE_BIN   command to run instead of `claude`
+  CLAUDE_CONFIG_DIR               Claude Code's config folder (default ~/.claude)
+
+How it knows what you had open:
+  - Every session's transcript (<config>/projects/*/<id>.jsonl) is written on
     every message, so its file time is when you last used that session.
-  - Claude keeps ~/.claude/sessions/<pid>.json while a session runs. A restart
-    kills the process but leaves the file, so a leftover file whose process is
-    gone means "this was open when the PC went down" -> pre-checked.
-  - Sessions still running right now are listed as "running" and can't be
-    opened again (that would start a second copy).
+  - Claude Code keeps <config>/sessions/<pid>.json while a session runs. A
+    restart kills the process but leaves the file, so a leftover file whose
+    process is gone means "this was open when the machine went down".
+  - Sessions still running are listed as "running" and can't be opened again.
 """
 import json
-import re
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-CLAUDE = Path.home() / ".claude"
+CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 PROJECTS = CLAUDE / "projects"
 REGISTRY = CLAUDE / "sessions"
 DEFAULT_COUNT = 15
 SCAN_LIMIT = 400          # newest transcripts to look at
 HEAD_BYTES = 256 * 1024   # enough of a transcript to find its cwd/title
 PRECHECK_DAYS = 3
-# Extra flags for every resumed session, e.g. CC_SESSION_RESTORE_CLAUDE_ARGS="--model opus"
 CLAUDE_ARGS = os.environ.get("CC_SESSION_RESTORE_CLAUDE_ARGS", "")
-WINDOW_NAME = "claude"
+CLAUDE_BIN = os.environ.get("CC_SESSION_RESTORE_CLAUDE_BIN", "claude")
+WINDOW_NAME = "claude"    # Windows Terminal window that sessions open in
+
+IS_WINDOWS = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+IS_WSL = bool(os.environ.get("WSL_DISTRO_NAME"))
+TEMP_DIRS = {str(Path(tempfile.gettempdir()).resolve()), "/tmp", "/private/tmp", "/var/folders"}
+
+
+def die(msg):
+    sys.exit(f"cc-session-restore: {msg}")
+
+
+# ---------------------------------------------------------------- liveness
+
+def _alive_windows(pid):
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+    k32.CloseHandle(h)
+    return bool(ok) and code.value == 259  # STILL_ACTIVE
 
 
 def is_alive(d):
-    """True if a registry entry's process is still running (and isn't a reused pid)."""
-    try:
-        stat = Path(f"/proc/{d['pid']}/stat").read_text()
-    except (OSError, KeyError):
+    """True if a registry entry's process is still running."""
+    pid = d.get("pid")
+    if not isinstance(pid, int):
         return False
-    starttime = stat.rsplit(")", 1)[1].split()[19]
-    return str(d.get("procStart", starttime)) == starttime
+    if IS_WINDOWS:
+        return _alive_windows(pid)
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists() or sys.platform.startswith("linux"):
+        # Linux: also compare start times, so a reused pid after reboot doesn't count.
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            return False
+        proc_start = d.get("procStart")
+        return proc_start is None or str(proc_start) == fields[19]
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
+
+# ---------------------------------------------------------------- discovery
 
 def read_registry():
     """-> (running session ids, ids left behind by a dead process, names by id)"""
-    running, dead, names = set(), set(), {}
-    newest = {}
+    running, dead, names, newest = set(), set(), {}, {}
     for f in REGISTRY.glob("*.json"):
         try:
-            d = json.loads(f.read_text())
+            d = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         sid = d.get("sessionId")
@@ -87,6 +143,8 @@ def read_head(path):
             d = json.loads(line)
         except ValueError:
             continue  # includes the cut-off last line
+        if not isinstance(d, dict):
+            continue
         if "cwd" in d and "cwd" not in info:
             info["cwd"] = d["cwd"]
             info["entrypoint"] = d.get("entrypoint")
@@ -95,6 +153,10 @@ def read_head(path):
         elif d.get("type") == "ai-title" and "aiTitle" not in info:
             info["aiTitle"] = d.get("aiTitle")
     return info
+
+
+def in_temp_dir(cwd):
+    return any(cwd == t or cwd.startswith((t + "/", t + os.sep)) for t in TEMP_DIRS)
 
 
 def recent_sessions():
@@ -113,15 +175,13 @@ def recent_sessions():
         info = read_head(p)
         cwd = info.get("cwd")
         # Only sessions you ran yourself in a terminal, in folders that still exist.
-        if info.get("entrypoint") != "cli" or not cwd or cwd.startswith("/tmp/"):
+        if info.get("entrypoint") != "cli" or not cwd or in_temp_dir(cwd):
             continue
         if not Path(cwd).is_dir():
             continue
-        title = (names.get(sid) or info.get("title") or info.get("aiTitle")
-                 or Path(cwd).name)
-        sessions.append({"id": sid, "cwd": cwd, "title": title,
-                         "mtime": mtime, "was_open": sid in dead,
-                         "running": sid in running})
+        title = names.get(sid) or info.get("title") or info.get("aiTitle") or Path(cwd).name
+        sessions.append({"id": sid, "cwd": cwd, "title": title, "mtime": mtime,
+                         "was_open": sid in dead, "running": sid in running})
     return sessions
 
 
@@ -132,6 +192,15 @@ def limit(sessions, count):
     return live + rest
 
 
+def precheck(sessions):
+    """Indexes of sessions killed by the latest restart. Older leftovers come from
+    earlier crashes, so only count those within a few days of the newest one."""
+    dead = [s for s in sessions if s["was_open"] and not s["running"]]
+    cutoff = max((s["mtime"] for s in dead), default=0) - PRECHECK_DAYS * 86400
+    return {i for i, s in enumerate(sessions)
+            if s["was_open"] and not s["running"] and s["mtime"] >= cutoff}
+
+
 def ago(ts):
     s = time.time() - ts
     for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
@@ -140,12 +209,126 @@ def ago(ts):
     return "just now"
 
 
-def show(sessions, selected):
+def pretty_path(cwd):
+    cwd = re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", cwd)  # WSL view of the Windows profile
     home = str(Path.home())
+    if cwd == home or cwd.startswith(home + os.sep):
+        cwd = "~" + cwd[len(home):]
+    return cwd
+
+
+# ---------------------------------------------------------------- launching
+
+def detect_terminal():
+    t = os.environ.get("CC_SESSION_RESTORE_TERMINAL")
+    if t:
+        return t
+    if IS_WSL and shutil.which("wt.exe"):
+        return "wsl"
+    if IS_WINDOWS:
+        return "windows-terminal" if shutil.which("wt.exe") else "windows-console"
+    if os.environ.get("TMUX"):
+        return "tmux"
+    if IS_MAC:
+        if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+            return "iterm"
+        if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+            return "macos-terminal"
+        return "iterm" if Path("/Applications/iTerm.app").exists() else "macos-terminal"
+    # Linux: the terminal we're running in, if we can tell, else the first one installed.
+    if os.environ.get("WEZTERM_PANE"):
+        return "wezterm"
+    if os.environ.get("KITTY_WINDOW_ID"):
+        return "kitty"
+    if os.environ.get("KONSOLE_VERSION"):
+        return "konsole"
+    if os.environ.get("GNOME_TERMINAL_SCREEN") or os.environ.get("GNOME_TERMINAL_SERVICE"):
+        return "gnome-terminal"
+    for t in ("gnome-terminal", "konsole", "xfce4-terminal", "kitty", "wezterm",
+              "alacritty", "x-terminal-emulator", "xterm"):
+        if shutil.which(t):
+            return t
+    die("couldn't find a terminal to open sessions in. Set CC_SESSION_RESTORE_TERMINAL.")
+
+
+def claude_cmd(s):
+    return f"{shlex.quote(CLAUDE_BIN)} --resume {s['id']} {CLAUDE_ARGS}".strip()
+
+
+def applescript_str(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def launch_cmd(s, terminal):
+    """-> (argv, popen kwargs) that open session s in a new tab/window."""
+    cwd, title, inner = s["cwd"], s["title"], claude_cmd(s)
+    win_cmd = ["cmd", "/k", CLAUDE_BIN, "--resume", s["id"], *shlex.split(CLAUDE_ARGS)]
+    # POSIX: run through a login+interactive shell so `claude` is on PATH the
+    # same way it is when you open a terminal yourself.
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    sh = [shell, "-lic", inner]
+
+    if terminal == "wsl":
+        distro = os.environ.get("WSL_DISTRO_NAME") or die("--terminal wsl only works inside WSL")
+        return ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", title, "wsl.exe",
+                "-d", distro, "--cd", cwd, "--", "bash", "-lic", inner], {}
+    if terminal == "windows-terminal":
+        return ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", title, "-d", cwd,
+                *win_cmd], {}
+    if terminal == "windows-console":
+        return win_cmd, {"cwd": cwd, "creationflags": 0x10}  # CREATE_NEW_CONSOLE
+    if terminal == "tmux":
+        return ["tmux", "new-window", "-n", title, "-c", cwd, shlex.join(sh)], {}
+    if terminal == "macos-terminal":
+        script = (f'tell application "Terminal"\nactivate\n'
+                  f'do script {applescript_str("cd " + shlex.quote(cwd) + " && " + inner)}\nend tell')
+        return ["osascript", "-e", script], {}
+    if terminal == "iterm":
+        script = (
+            'tell application "iTerm2"\nactivate\n'
+            'if (count of windows) = 0 then\ncreate window with default profile\n'
+            'else\ntell current window to create tab with default profile\nend if\n'
+            f'tell current session of current window to write text '
+            f'{applescript_str("cd " + shlex.quote(cwd) + " && " + inner)}\nend tell')
+        return ["osascript", "-e", script], {}
+    linux = {
+        "gnome-terminal": ["gnome-terminal", "--tab", "--title", title, "--working-directory", cwd, "--", *sh],
+        "konsole": ["konsole", "--new-tab", "--workdir", cwd, "-e", *sh],
+        "xfce4-terminal": ["xfce4-terminal", "--tab", "--title", title, "--working-directory", cwd, "-x", *sh],
+        "kitty": ["kitty", "--directory", cwd, "--title", title, *sh],
+        "wezterm": (["wezterm", "cli", "spawn", "--cwd", cwd, "--", *sh] if os.environ.get("WEZTERM_PANE")
+                    else ["wezterm", "start", "--cwd", cwd, "--", *sh]),
+        "alacritty": ["alacritty", "--working-directory", cwd, "--title", title, "-e", *sh],
+        "x-terminal-emulator": ["x-terminal-emulator", "-e", *sh],
+        "xterm": ["xterm", "-T", title, "-e", *sh],
+    }
+    if terminal in linux:
+        return linux[terminal], {"cwd": cwd}
+    die(f"unknown terminal '{terminal}'. Run with --help to see the options.")
+
+
+def launch(sessions, dry_run=False, terminal=None, log=print):
+    terminal = terminal or detect_terminal()
+    for s in sessions:
+        argv, kw = launch_cmd(s, terminal)
+        if dry_run:
+            log(" ".join(shlex.quote(c) for c in argv))
+            continue
+        if not shutil.which(argv[0]):
+            die(f"'{argv[0]}' not found (terminal: {terminal}). Set CC_SESSION_RESTORE_TERMINAL.")
+        log(f"  opening {s['title']}")
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, **kw)
+        # Windows Terminal drops tabs that arrive too fast; others just keep order.
+        time.sleep(0.8 if terminal in ("wsl", "windows-terminal") else 0.3)
+
+
+# ---------------------------------------------------------------- text UI
+
+def show(sessions, selected):
     for i, s in enumerate(sessions, 1):
         mark = "running" if s["running"] else ("[x]" if i - 1 in selected else "[ ]")
-        where = re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", s["cwd"]).replace(home, "~")
-        print(f"  {mark:>7} {i:2}  {s['title'][:28]:<28}  {ago(s['mtime']):>9}  {where}")
+        print(f"  {mark:>7} {i:2}  {s['title'][:28]:<28}  {ago(s['mtime']):>9}  {pretty_path(s['cwd'])}")
 
 
 def pick(sessions, selected):
@@ -170,72 +353,322 @@ def pick(sessions, selected):
                     selected ^= {int(tok) - 1}
 
 
-def launch(sessions, dry_run):
-    distro = os.environ.get("WSL_DISTRO_NAME")
-    if not distro:
-        sys.exit("cc-session-restore: run this inside WSL (WSL_DISTRO_NAME is not set).")
-    if not dry_run and not shutil.which("wt.exe"):
-        sys.exit("cc-session-restore: wt.exe not found. Install Windows Terminal, "
-                 "and make sure WSL interop / Windows PATH is enabled.")
-    for s in sessions:
-        inner = f"claude --resume {s['id']} {CLAUDE_ARGS}".strip()
-        cmd = ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", s["title"],
-               "wsl.exe", "-d", distro, "--cd", s["cwd"], "--", "bash", "-lic", inner]
-        if dry_run:
-            print(" ".join(shlex.quote(c) for c in cmd))
-            continue
-        print(f"  opening {s['title']}")
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-        time.sleep(0.8)  # wt drops tabs if they arrive too fast
+# ---------------------------------------------------------------- window (local web page)
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code sessions</title>
+<style>
+:root { color-scheme:light dark; --bg:#f6f5f2; --card:#fff; --text:#1f1e1c; --muted:#6f6c66; --line:#e6e3dd;
+        --accent:#c96442; --accent-text:#fff; --hover:#faf8f5; --pill:#ecebe7; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#1c1b19; --card:#262522; --text:#ecebe7; --muted:#9c988f; --line:#363430;
+          --accent:#d97757; --accent-text:#1c1b19; --hover:#2d2b28; --pill:#363430; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text);
+       font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+main { max-width:880px; margin:0 auto; padding:32px 16px 110px; }
+h1 { font-size:22px; margin:0 0 4px; font-weight:650; }
+.sub { color:var(--muted); margin:0 0 20px; }
+.list { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+.row { display:grid; grid-template-columns:28px 1fr auto; gap:12px; align-items:center;
+       padding:12px 16px; border-top:1px solid var(--line); cursor:pointer; user-select:none; }
+.row:first-child { border-top:0; }
+.row:hover { background:var(--hover); }
+.row input { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; margin:0; }
+.title { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.folder { color:var(--muted); font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+          overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.meta { color:var(--muted); font-size:13px; text-align:right; white-space:nowrap; }
+.pill { display:inline-block; background:var(--pill); border-radius:999px; padding:1px 9px;
+        font-size:12px; margin-right:8px; color:var(--muted); }
+.row.running { cursor:default; opacity:.55; }
+.row.running:hover { background:transparent; }
+.info { min-width:0; }
+.empty { padding:40px 16px; text-align:center; color:var(--muted); }
+footer { position:fixed; left:0; right:0; bottom:0; background:color-mix(in srgb, var(--bg) 88%, transparent);
+         backdrop-filter:blur(8px); border-top:1px solid var(--line); }
+footer .in { max-width:880px; margin:0 auto; padding:14px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+button { font:inherit; border-radius:8px; padding:8px 14px; cursor:pointer;
+         border:1px solid var(--line); background:var(--card); color:var(--text); }
+button:hover { background:var(--hover); }
+button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-text); font-weight:600; }
+button.primary:disabled { opacity:.45; cursor:default; }
+.hint { color:var(--muted); font-size:13px; margin-left:auto; }
+.done { text-align:center; padding:80px 16px; }
+.done h1 { font-size:24px; }
+@media (max-width:560px) { .hint { display:none; } .meta .ago { display:block; } }
+</style></head>
+<body>
+<main id="app">
+  <h1>Claude Code sessions</h1>
+  <p class="sub" id="sub">Loading...</p>
+  <div class="list" id="list"></div>
+</main>
+<footer id="bar"><div class="in">
+  <button class="primary" id="open" disabled>Open</button>
+  <button id="all">All</button><button id="none">None</button><button id="more">Show more</button>
+  <span class="hint">Enter opens checked &middot; double-click a row to open just that one</span>
+</div></footer>
+<script>
+const T = new URLSearchParams(location.search).get("t");
+let n = 15, rows = [], checked = new Set();
+const $ = id => document.getElementById(id);
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+function render() {
+  const list = $("list"); list.replaceChildren();
+  if (!rows.length) { list.append(el("div", "empty", "No Claude Code sessions found.")); }
+  rows.forEach(s => {
+    const r = el("div", "row" + (s.running ? " running" : ""));
+    const box = el("input"); box.type = "checkbox"; box.disabled = s.running; box.checked = checked.has(s.id);
+    box.tabIndex = -1;
+    const info = el("div", "info");
+    info.append(el("div", "title", s.title), el("div", "folder", s.folder));
+    const meta = el("div", "meta");
+    if (s.running) meta.append(el("span", "pill", "running"));
+    meta.append(el("span", "ago", s.ago));
+    r.append(box, info, meta);
+    if (!s.running) {
+      r.onclick = () => { checked.has(s.id) ? checked.delete(s.id) : checked.add(s.id); render(); };
+      r.ondblclick = () => openIds([s.id]);
+    }
+    list.append(r);
+  });
+  const k = checked.size;
+  $("open").disabled = !k;
+  $("open").textContent = k ? `Open ${k} session${k > 1 ? "s" : ""}` : "Open";
+}
+
+async function load() {
+  const res = await fetch(`/api/sessions?t=${T}&n=${n}`);
+  const data = await res.json();
+  rows = data.sessions;
+  checked = new Set(rows.filter(s => s.checked).map(s => s.id));
+  const live = rows.filter(s => s.running).length;
+  $("sub").textContent = "Checked sessions were open when your machine went down." +
+    (live ? ` ${live} already running (greyed out).` : "");
+  render();
+}
+
+async function openIds(ids) {
+  if (!ids.length) return;
+  $("open").disabled = true;
+  const res = await fetch(`/api/open?t=${T}`, { method: "POST", body: JSON.stringify({ ids }) });
+  const data = await res.json();
+  $("bar").remove();
+  const app = $("app"); app.replaceChildren();
+  const d = el("div", "done");
+  d.append(el("h1", null, data.error ? "Something went wrong" : `Opened ${data.opened} session${data.opened === 1 ? "" : "s"}`),
+           el("p", "sub", data.error || "You can close this tab."));
+  app.append(d);
+  setTimeout(() => window.close(), 1500);
+}
+
+$("open").onclick = () => openIds([...checked]);
+$("all").onclick = () => { checked = new Set(rows.filter(s => !s.running).map(s => s.id)); render(); };
+$("none").onclick = () => { checked.clear(); render(); };
+$("more").onclick = () => { n += 25; load(); };
+document.addEventListener("keydown", e => { if (e.key === "Enter" && checked.size) openIds([...checked]); });
+load();
+</script>
+</body></html>
+"""
 
 
-def precheck(sessions):
-    """Indexes of sessions killed by the latest restart. Older leftovers come from
-    earlier crashes, so only count those within a few days of the newest one."""
-    dead = [s for s in sessions if s["was_open"] and not s["running"]]
-    cutoff = max((s["mtime"] for s in dead), default=0) - PRECHECK_DAYS * 86400
-    return {i for i, s in enumerate(sessions)
-            if s["was_open"] and not s["running"] and s["mtime"] >= cutoff}
+def sessions_payload(count):
+    sessions = limit(recent_sessions(), count)
+    checked = precheck(sessions)
+    return {"running": sum(s["running"] for s in sessions), "sessions": [
+        {"id": s["id"], "title": s["title"], "cwd": s["cwd"], "ago": ago(s["mtime"]),
+         "folder": pretty_path(s["cwd"]), "checked": i in checked, "running": s["running"]}
+        for i, s in enumerate(sessions)]}
 
+
+def open_in_browser(url):
+    import webbrowser
+    if IS_WSL and shutil.which("cmd.exe"):  # use the Windows browser
+        subprocess.Popen(["cmd.exe", "/c", "start", "", url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, cwd="/mnt/c" if Path("/mnt/c").is_dir() else None)
+    else:
+        webbrowser.open(url)
+
+
+def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
+    """Serve the picker page on localhost until you open sessions or leave it idle."""
+    import secrets
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    token = secrets.token_urlsafe(16)  # so other web pages can't drive this server
+    state = {"done": False, "last": time.time()}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def send(self, code, body, ctype="application/json"):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def authorized(self):
+            state["last"] = time.time()
+            q = parse_qs(urlparse(self.path).query)
+            if q.get("t", [None])[0] != token:
+                self.send(403, '{"error": "bad token"}')
+                return None
+            return q
+
+        def do_GET(self):
+            q = self.authorized()
+            if q is None:
+                return
+            path = urlparse(self.path).path
+            if path == "/":
+                self.send(200, PAGE, "text/html")
+            elif path == "/api/sessions":
+                n = q.get("n", [str(count)])[0]
+                self.send(200, json.dumps(sessions_payload(int(n) if n.isdigit() else count)))
+            else:
+                self.send(404, '{"error": "not found"}')
+
+        def do_POST(self):
+            if self.authorized() is None:
+                return
+            if urlparse(self.path).path != "/api/open":
+                return self.send(404, '{"error": "not found"}')
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                ids = json.loads(self.rfile.read(length) or b"{}").get("ids") or []
+                by_id = {s["id"]: s for s in recent_sessions() if not s["running"]}
+                chosen = [by_id[i] for i in ids if i in by_id]
+                launch(chosen, terminal=terminal, log=lambda *_: None)
+                self.send(200, json.dumps({"opened": len(chosen)}))
+                state["done"] = True
+            except SystemExit as e:  # die() inside launch
+                self.send(200, json.dumps({"error": str(e), "opened": 0}))
+            except Exception as e:
+                self.send(500, json.dumps({"error": f"{type(e).__name__}: {e}", "opened": 0}))
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/?t={token}"
+    print(f"cc-session-restore: {url}", flush=True)
+    if browser:
+        open_in_browser(url)
+    srv.timeout = 0.5
+    while not state["done"] and time.time() - state["last"] < idle_timeout:
+        srv.handle_request()
+    srv.server_close()
+
+
+# ---------------------------------------------------------------- install
+
+def windows_shortcut(powershell, target, arguments, workdir):
+    """Create '<Start menu>/Claude Code sessions.lnk' via PowerShell."""
+    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path "
+          "([Environment]::GetFolderPath('Programs')) 'Claude Code sessions.lnk'));"
+          f"$s.TargetPath={q(target)};$s.Arguments={q(arguments)};"
+          f"$s.WorkingDirectory={q(workdir)};$s.WindowStyle=7;"
+          "$s.Description='Reopen your Claude Code sessions (cc-session-restore)';$s.Save()")
+    subprocess.run([powershell, "-NoProfile", "-Command", ps], check=True,
+                   cwd="/mnt/c" if IS_WSL and Path("/mnt/c").is_dir() else None)
+
+
+def install():
+    """Add a "Claude Code sessions" launcher that opens the picker page."""
+    me = Path(__file__).resolve()
+    if IS_WSL:
+        # Start menu shortcut -> hidden PowerShell -> hidden wsl.exe -> this script.
+        # The command is base64-encoded so paths with spaces/quotes survive.
+        import base64
+        distro = os.environ["WSL_DISTRO_NAME"]
+        wsl_args = f'-d {distro} --cd "{me.parent}" -- python3 "./{me.name}" --gui'
+        cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '{wsl_args.replace(chr(39), chr(39) * 2)}'"
+        enc = base64.b64encode(cmd.encode("utf-16-le")).decode()
+        windows_shortcut("powershell.exe", "powershell.exe",
+                         f"-NoProfile -WindowStyle Hidden -EncodedCommand {enc}", "C:\\")
+        print("Added Windows Start menu shortcut: Claude Code sessions")
+    elif IS_WINDOWS:
+        pyw = Path(sys.executable).with_name("pythonw.exe")  # no console window
+        windows_shortcut("powershell", pyw if pyw.exists() else sys.executable,
+                         f'"{me}" --gui', me.parent)
+        print("Added Start menu shortcut: Claude Code sessions")
+    elif IS_MAC:
+        app = Path.home() / "Applications" / "Claude Code sessions.command"
+        app.parent.mkdir(exist_ok=True)
+        app.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(me))} --gui\n")
+        app.chmod(0o755)
+        print(f"Added {app}\n(double-click it, or drag it to the Dock)")
+    else:
+        apps = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "applications"
+        apps.mkdir(parents=True, exist_ok=True)
+        entry = apps / "cc-session-restore.desktop"
+        entry.write_text(
+            "[Desktop Entry]\nType=Application\nName=Claude Code sessions\n"
+            "Comment=Reopen your Claude Code sessions\n"
+            f"Exec={shlex.quote(sys.executable)} {shlex.quote(str(me))} --gui\n"
+            "Icon=utilities-terminal\nTerminal=false\nCategories=Development;\n")
+        print(f"Added app launcher: {entry}")
+
+
+# ---------------------------------------------------------------- main
 
 def main(argv):
     if "-h" in argv or "--help" in argv:
         print(__doc__)
         return False
+    if "--install" in argv:
+        install()
+        return False
+
+    def opt(flag):
+        if flag not in argv:
+            return None
+        i = argv.index(flag)
+        if i + 1 >= len(argv):
+            die(f"{flag} needs a value")
+        return argv[i + 1]
+
     count = DEFAULT_COUNT
-    if "-n" in argv:
-        try:
-            count = int(argv[argv.index("-n") + 1])
-        except (IndexError, ValueError):
-            sys.exit("cc-session-restore: -n needs a number")
+    if opt("-n") is not None:
+        if not opt("-n").isdigit():
+            die("-n needs a number")
+        count = int(opt("-n"))
+    terminal = opt("--terminal")
+    dry_run = "--dry-run" in argv
+
+    if "--gui" in argv:
+        port = opt("--port")
+        run_gui(count, terminal, browser="--no-browser" not in argv,
+                port=int(port) if port and port.isdigit() else 0)
+        return True
 
     sessions = recent_sessions()
-    n_running = sum(s["running"] for s in sessions)
-
-    if "--open" in argv:  # used by the GUI: open these session ids
+    if "--open" in argv:
         ids = argv[argv.index("--open") + 1:]
         by_id = {s["id"]: s for s in sessions if not s["running"]}
-        launch([by_id[i] for i in ids if i in by_id], "--dry-run" in argv)
+        launch([by_id[i] for i in ids if i in by_id], dry_run, terminal)
         return True
 
     sessions = limit(sessions, count)
-    if "--json" in argv:  # used by the GUI: print the list
-        checked = precheck(sessions)
-        print(json.dumps({"running": n_running, "sessions": [
-            {"id": s["id"], "title": s["title"], "cwd": s["cwd"], "ago": ago(s["mtime"]),
-             "folder": re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", s["cwd"]),
-             "checked": i in checked, "running": s["running"]} for i, s in enumerate(sessions)]}))
+    if "--json" in argv:
+        print(json.dumps(sessions_payload(count)))
         return False
 
     print("\ncc-session-restore - your most recent Claude Code sessions")
-    print("[x] = was open when the PC went down    running = already open")
-    print()
+    print("[x] = was open when the machine went down    running = already open\n")
     if not sessions:
         print("No sessions found.")
         return False
     selected = precheck(sessions)
-
     if "list" in argv:
         show(sessions, selected)
         return False
@@ -244,13 +677,15 @@ def main(argv):
     if not chosen:
         print("Nothing opened.")
         return False
-    launch(chosen, "--dry-run" in argv)
+    launch(chosen, dry_run, terminal)
     return True
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # titles may have emoji
     opened = main([a for a in sys.argv[1:] if a != "--wait"])
-    # Double-clicked from Windows: keep the window up so you can read it.
+    # Double-clicked from a file manager: keep the window up so you can read it.
     if "--wait" in sys.argv and not opened:
         try:
             input("\nPress Enter to close.")
