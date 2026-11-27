@@ -1,0 +1,5 @@
+# local tool state
+.claude/
+.deeppairing/
+*.lnk
+__pycache__/

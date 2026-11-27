@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""cc-session-restore - reopen your Claude Code sessions after a restart (Windows + WSL).
+
+Unofficial; not affiliated with Anthropic.
+
+  cc-session-restore            list recent sessions, pick, open each in a Windows Terminal tab
+  cc-session-restore -n 25      show 25 sessions instead of 15
+  cc-session-restore list       just print the list
+  cc-session-restore -y         open the pre-checked sessions without asking
+  cc-session-restore --dry-run  print the launch commands instead of running them
+  cc-session-restore --json     machine-readable list (used by the GUI)
+  cc-session-restore --open ID [ID ...]   open these sessions (used by the GUI)
+
+How it knows what you had open, with no setup:
+  - Every session's transcript (~/.claude/projects/*/<id>.jsonl) is written on
+    every message, so its file time is when you last used that session.
+  - Claude keeps ~/.claude/sessions/<pid>.json while a session runs. A restart
+    kills the process but leaves the file, so a leftover file whose process is
+    gone means "this was open when the PC went down" -> pre-checked.
+  - Sessions still running right now are listed as "running" and can't be
+    opened again (that would start a second copy).
+"""
+import json
+import re
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CLAUDE = Path.home() / ".claude"
+PROJECTS = CLAUDE / "projects"
+REGISTRY = CLAUDE / "sessions"
+DEFAULT_COUNT = 15
+SCAN_LIMIT = 400          # newest transcripts to look at
+HEAD_BYTES = 256 * 1024   # enough of a transcript to find its cwd/title
+PRECHECK_DAYS = 3
+# Extra flags for every resumed session, e.g. CC_SESSION_RESTORE_CLAUDE_ARGS="--model opus"
+CLAUDE_ARGS = os.environ.get("CC_SESSION_RESTORE_CLAUDE_ARGS", "")
+WINDOW_NAME = "claude"
+
+
+def is_alive(d):
+    """True if a registry entry's process is still running (and isn't a reused pid)."""
+    try:
+        stat = Path(f"/proc/{d['pid']}/stat").read_text()
+    except (OSError, KeyError):
+        return False
+    starttime = stat.rsplit(")", 1)[1].split()[19]
+    return str(d.get("procStart", starttime)) == starttime
+
+
+def read_registry():
+    """-> (running session ids, ids left behind by a dead process, names by id)"""
+    running, dead, names = set(), set(), {}
+    newest = {}
+    for f in REGISTRY.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sid = d.get("sessionId")
+        if not sid:
+            continue
+        if is_alive(d):
+            running.add(sid)
+        elif d.get("entrypoint") == "cli" and d.get("kind") == "interactive":
+            dead.add(sid)
+        upd = d.get("updatedAt") or 0
+        if d.get("name") and upd >= newest.get(sid, -1):
+            newest[sid], names[sid] = upd, d["name"]
+    return running, dead - running, names
+
+
+def read_head(path):
+    """Pull cwd, entrypoint and title from the start of a transcript."""
+    info = {}
+    try:
+        with open(path, "rb") as fh:
+            chunk = fh.read(HEAD_BYTES)
+    except OSError:
+        return info
+    for line in chunk.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue  # includes the cut-off last line
+        if "cwd" in d and "cwd" not in info:
+            info["cwd"] = d["cwd"]
+            info["entrypoint"] = d.get("entrypoint")
+        if d.get("type") == "custom-title":
+            info["title"] = d.get("customTitle")
+        elif d.get("type") == "ai-title" and "aiTitle" not in info:
+            info["aiTitle"] = d.get("aiTitle")
+    return info
+
+
+def recent_sessions():
+    running, dead, names = read_registry()
+    files = []
+    for p in PROJECTS.glob("*/*.jsonl"):
+        try:
+            files.append((p.stat().st_mtime, p))
+        except OSError:
+            pass
+    files.sort(reverse=True)
+
+    sessions = []
+    for mtime, p in files[:SCAN_LIMIT]:
+        sid = p.stem
+        info = read_head(p)
+        cwd = info.get("cwd")
+        # Only sessions you ran yourself in a terminal, in folders that still exist.
+        if info.get("entrypoint") != "cli" or not cwd or cwd.startswith("/tmp/"):
+            continue
+        if not Path(cwd).is_dir():
+            continue
+        title = (names.get(sid) or info.get("title") or info.get("aiTitle")
+                 or Path(cwd).name)
+        sessions.append({"id": sid, "cwd": cwd, "title": title,
+                         "mtime": mtime, "was_open": sid in dead,
+                         "running": sid in running})
+    return sessions
+
+
+def limit(sessions, count):
+    """All running sessions, then the `count` most recent ones that aren't running."""
+    live = [s for s in sessions if s["running"]]
+    rest = [s for s in sessions if not s["running"]][:count]
+    return live + rest
+
+
+def ago(ts):
+    s = time.time() - ts
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{int(s // n)}{unit} ago"
+    return "just now"
+
+
+def show(sessions, selected):
+    home = str(Path.home())
+    for i, s in enumerate(sessions, 1):
+        mark = "running" if s["running"] else ("[x]" if i - 1 in selected else "[ ]")
+        where = re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", s["cwd"]).replace(home, "~")
+        print(f"  {mark:>7} {i:2}  {s['title'][:28]:<28}  {ago(s['mtime']):>9}  {where}")
+
+
+def pick(sessions, selected):
+    while True:
+        show(sessions, selected)
+        try:
+            ans = input("\nEnter = open checked | numbers (e.g. 2 5) = toggle | a = all | n = none | q = quit: ").strip().lower()
+        except EOFError:
+            return []
+        print()
+        if ans == "":
+            return [sessions[i] for i in sorted(selected)]
+        if ans == "q":
+            return []
+        if ans == "a":
+            selected = {i for i, s in enumerate(sessions) if not s["running"]}
+        elif ans == "n":
+            selected = set()
+        else:
+            for tok in ans.replace(",", " ").split():
+                if tok.isdigit() and 1 <= int(tok) <= len(sessions) and not sessions[int(tok) - 1]["running"]:
+                    selected ^= {int(tok) - 1}
+
+
+def launch(sessions, dry_run):
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    if not distro:
+        sys.exit("cc-session-restore: run this inside WSL (WSL_DISTRO_NAME is not set).")
+    if not dry_run and not shutil.which("wt.exe"):
+        sys.exit("cc-session-restore: wt.exe not found. Install Windows Terminal, "
+                 "and make sure WSL interop / Windows PATH is enabled.")
+    for s in sessions:
+        inner = f"claude --resume {s['id']} {CLAUDE_ARGS}".strip()
+        cmd = ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", s["title"],
+               "wsl.exe", "-d", distro, "--cd", s["cwd"], "--", "bash", "-lic", inner]
+        if dry_run:
+            print(" ".join(shlex.quote(c) for c in cmd))
+            continue
+        print(f"  opening {s['title']}")
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        time.sleep(0.8)  # wt drops tabs if they arrive too fast
+
+
+def precheck(sessions):
+    """Indexes of sessions killed by the latest restart. Older leftovers come from
+    earlier crashes, so only count those within a few days of the newest one."""
+    dead = [s for s in sessions if s["was_open"] and not s["running"]]
+    cutoff = max((s["mtime"] for s in dead), default=0) - PRECHECK_DAYS * 86400
+    return {i for i, s in enumerate(sessions)
+            if s["was_open"] and not s["running"] and s["mtime"] >= cutoff}
+
+
+def main(argv):
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return False
+    count = DEFAULT_COUNT
+    if "-n" in argv:
+        try:
+            count = int(argv[argv.index("-n") + 1])
+        except (IndexError, ValueError):
+            sys.exit("cc-session-restore: -n needs a number")
+
+    sessions = recent_sessions()
+    n_running = sum(s["running"] for s in sessions)
+
+    if "--open" in argv:  # used by the GUI: open these session ids
+        ids = argv[argv.index("--open") + 1:]
+        by_id = {s["id"]: s for s in sessions if not s["running"]}
+        launch([by_id[i] for i in ids if i in by_id], "--dry-run" in argv)
+        return True
+
+    sessions = limit(sessions, count)
+    if "--json" in argv:  # used by the GUI: print the list
+        checked = precheck(sessions)
+        print(json.dumps({"running": n_running, "sessions": [
+            {"id": s["id"], "title": s["title"], "cwd": s["cwd"], "ago": ago(s["mtime"]),
+             "folder": re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", s["cwd"]),
+             "checked": i in checked, "running": s["running"]} for i, s in enumerate(sessions)]}))
+        return False
+
+    print("\ncc-session-restore - your most recent Claude Code sessions")
+    print("[x] = was open when the PC went down    running = already open")
+    print()
+    if not sessions:
+        print("No sessions found.")
+        return False
+    selected = precheck(sessions)
+
+    if "list" in argv:
+        show(sessions, selected)
+        return False
+    chosen = ([sessions[i] for i in sorted(selected)] if ("-y" in argv or "--yes" in argv)
+              else pick(sessions, selected))
+    if not chosen:
+        print("Nothing opened.")
+        return False
+    launch(chosen, "--dry-run" in argv)
+    return True
+
+
+if __name__ == "__main__":
+    opened = main([a for a in sys.argv[1:] if a != "--wait"])
+    # Double-clicked from Windows: keep the window up so you can read it.
+    if "--wait" in sys.argv and not opened:
+        try:
+            input("\nPress Enter to close.")
+        except EOFError:
+            pass
