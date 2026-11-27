@@ -1,0 +1,87 @@
+name: Bug report
+description: Something went wrong, or a session list or launcher didn't work on your setup.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this.
+
+        **Please don't paste private details.** Session titles, folder paths, usernames and transcript contents can reveal what you work on. Replace them with placeholders like `~/project-a` or `<session-id>` before you submit.
+
+        For security problems, don't open an issue: see [SECURITY.md](https://github.com/mitchjablonski/cc-session-restore/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Include any error message.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Where does Claude Code run?
+      options:
+        - WSL
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: e.g. Windows 11 24H2 + Ubuntu 24.04 (WSL), macOS 15.1, Fedora 41
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: The terminal sessions open in (or should open in), and whether you set `--terminal` or `CC_SESSION_RESTORE_TERMINAL`.
+      placeholder: e.g. Windows Terminal, iTerm2, GNOME Terminal inside tmux
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How did you run it?
+      options:
+        - Browser page (launcher or --gui)
+        - Terminal picker
+        - "-y, list, --json or --open"
+        - "--install"
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: "`claude --version`"
+      placeholder: e.g. 2.1.0 (Claude Code)
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: "`python3 --version` (Windows: `python --version`)"
+    validations:
+      required: true
+  - type: input
+    id: tool-version
+    attributes:
+      label: cc-session-restore version
+      description: Run `git rev-parse --short HEAD` in your clone.
+  - type: textarea
+    id: dry-run
+    attributes:
+      label: "`--dry-run` output"
+      description: |
+        If a session didn't open, run `cc-session-restore -y --dry-run` (or `--open <session-id> --dry-run`) and paste the output. It prints the commands without opening anything. Replace folder paths, titles and session ids with placeholders.
+      render: shell
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`doctor` output"
+      description: If your version has a `cc-session-restore doctor` command, paste its output here, with private paths replaced. Otherwise leave this empty.
+      render: shell
