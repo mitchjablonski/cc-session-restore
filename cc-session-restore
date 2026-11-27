@@ -29,9 +29,9 @@ Environment:
 How it knows what you had open:
   - Every session's transcript (<config>/projects/*/<id>.jsonl) is written on
     every message, so its file time is when you last used that session.
-  - Claude Code keeps <config>/sessions/<pid>.json while a session runs. A
-    restart kills the process but leaves the file, so a leftover file whose
-    process is gone means "this was open when the machine went down".
+  - Claude Code keeps <config>/sessions/<pid>.json while a session runs and
+    removes it on a clean exit. A file whose process started before the
+    machine's last boot means "this was open when the machine went down".
   - Sessions still running are listed as "running" and can't be opened again.
 """
 import json
@@ -49,24 +49,68 @@ CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 PROJECTS = CLAUDE / "projects"
 REGISTRY = CLAUDE / "sessions"
 DEFAULT_COUNT = 15
-SCAN_LIMIT = 400          # newest transcripts to look at
-HEAD_BYTES = 256 * 1024   # enough of a transcript to find its cwd/title
-PRECHECK_DAYS = 3
+SCAN_LIMIT = 1000           # newest transcripts to look at
+CHUNK = 64 * 1024           # transcripts are read in chunks...
+HEAD_MAX = 4 * 1024 * 1024  # ...until the first line with a cwd, up to this much
+TAIL_BYTES = 1024 * 1024    # end of the transcript, for the latest title
+PRECHECK_DAYS = 7           # pre-check leftovers within this long of the newest one
+MAX_AGE_DAYS = 14           # ...and only if last seen within this long before boot
 CLAUDE_ARGS = os.environ.get("CC_SESSION_RESTORE_CLAUDE_ARGS", "")
 CLAUDE_BIN = os.environ.get("CC_SESSION_RESTORE_CLAUDE_BIN", "claude")
-WINDOW_NAME = "claude"    # Windows Terminal window that sessions open in
+WINDOW_NAME = "claude"      # Windows Terminal window that sessions open in
 
 IS_WINDOWS = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 IS_WSL = bool(os.environ.get("WSL_DISTRO_NAME"))
-TEMP_DIRS = {str(Path(tempfile.gettempdir()).resolve()), "/tmp", "/private/tmp", "/var/folders"}
+SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,127}$")
+TEMP_DIRS = {os.path.normcase(p) for p in
+             (str(Path(tempfile.gettempdir()).resolve()), "/tmp", "/private/tmp", "/var/folders")}
 
 
 def die(msg):
     sys.exit(f"cc-session-restore: {msg}")
 
 
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def clean_title(t):
+    """Titles can come from model-generated text: keep them printable and short."""
+    if not isinstance(t, str):
+        return ""
+    t = re.sub(r"[\x00-\x1f\x7f]+", " ", t)
+    return " ".join(t.split())[:80]
+
+
 # ---------------------------------------------------------------- liveness
+
+_boot = []
+
+
+def boot_time():
+    """Unix time of the last boot (the WSL VM's, inside WSL), or None."""
+    if not _boot:
+        bt = None
+        try:
+            if IS_WINDOWS:
+                import ctypes
+                ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+                bt = time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
+            elif IS_MAC:
+                out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                                     text=True, timeout=5).stdout
+                m = re.search(r"sec = (\d+)", out)
+                bt = int(m.group(1)) if m else None
+            else:
+                for line in Path("/proc/stat").read_text().splitlines():
+                    if line.startswith("btime "):
+                        bt = int(line.split()[1])
+        except Exception:
+            bt = None
+        _boot.append(bt)
+    return _boot[0]
+
 
 def _alive_windows(pid):
     import ctypes
@@ -83,18 +127,21 @@ def _alive_windows(pid):
 def is_alive(d):
     """True if a registry entry's process is still running."""
     pid = d.get("pid")
-    if not isinstance(pid, int):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    # Started before the last boot -> dead, whatever holds that pid now.
+    started, bt = num(d.get("startedAt")) / 1000, boot_time()
+    if started and bt and started < bt - 60:
         return False
     if IS_WINDOWS:
         return _alive_windows(pid)
     stat = Path(f"/proc/{pid}/stat")
     if stat.exists() or sys.platform.startswith("linux"):
-        # Linux: also compare start times, so a reused pid after reboot doesn't count.
         try:
             fields = stat.read_text().rsplit(")", 1)[1].split()
-        except OSError:
+        except (OSError, IndexError):
             return False
-        proc_start = d.get("procStart")
+        proc_start = d.get("procStart")  # same pid but a different process -> dead
         return proc_start is None or str(proc_start) == fields[19]
     try:
         os.kill(pid, 0)
@@ -109,58 +156,95 @@ def is_alive(d):
 
 # ---------------------------------------------------------------- discovery
 
-def read_registry():
-    """-> (running session ids, ids left behind by a dead process, names by id)"""
-    running, dead, names, newest = set(), set(), {}, {}
-    for f in REGISTRY.glob("*.json"):
+def _load_json(f):
+    for attempt in range(2):  # Claude may be rewriting the file right now
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            return d if isinstance(d, dict) else None
+        except (OSError, ValueError, UnicodeDecodeError):
+            if attempt == 0:
+                time.sleep(0.05)
+    return None
+
+
+def read_registry():
+    """-> running ids, {dead id: last seen}, {id: user-given name}, {id: derived name}"""
+    running, dead, user_names, other_names, newest = set(), {}, {}, {}, {}
+    for f in REGISTRY.glob("*.json"):
+        d = _load_json(f)
+        if not d:
             continue
         sid = d.get("sessionId")
-        if not sid:
+        if not isinstance(sid, str) or not SESSION_ID.match(sid):
             continue
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            mtime = 0
+        seen = max(num(d.get("updatedAt")) / 1000, num(d.get("statusUpdatedAt")) / 1000, mtime)
         if is_alive(d):
             running.add(sid)
         elif d.get("entrypoint") == "cli" and d.get("kind") == "interactive":
-            dead.add(sid)
-        upd = d.get("updatedAt") or 0
-        if d.get("name") and upd >= newest.get(sid, -1):
-            newest[sid], names[sid] = upd, d["name"]
-    return running, dead - running, names
+            dead[sid] = max(dead.get(sid, 0), seen)
+        name = clean_title(d.get("name"))
+        if name and seen >= newest.get(sid, -1):
+            newest[sid] = seen
+            (user_names if d.get("nameSource") == "user" else other_names)[sid] = name
+    for sid in running:
+        dead.pop(sid, None)
+    return running, dead, user_names, other_names
 
 
-def read_head(path):
-    """Pull cwd, entrypoint and title from the start of a transcript."""
-    info = {}
-    try:
-        with open(path, "rb") as fh:
-            chunk = fh.read(HEAD_BYTES)
-    except OSError:
-        return info
-    for line in chunk.splitlines():
+def _scan(data, info):
+    for line in data.splitlines():
+        if b'"cwd"' not in line and b'-title"' not in line:
+            continue
         try:
             d = json.loads(line)
         except ValueError:
-            continue  # includes the cut-off last line
+            continue  # includes cut-off first/last lines
         if not isinstance(d, dict):
             continue
-        if "cwd" in d and "cwd" not in info:
+        if "cwd" not in info and isinstance(d.get("cwd"), str):
             info["cwd"] = d["cwd"]
             info["entrypoint"] = d.get("entrypoint")
-        if d.get("type") == "custom-title":
-            info["title"] = d.get("customTitle")
-        elif d.get("type") == "ai-title" and "aiTitle" not in info:
-            info["aiTitle"] = d.get("aiTitle")
+        if d.get("type") == "custom-title" and clean_title(d.get("customTitle")):
+            info["title"] = clean_title(d.get("customTitle"))  # later lines win
+        elif d.get("type") == "ai-title" and clean_title(d.get("aiTitle")):
+            info["aiTitle"] = clean_title(d.get("aiTitle"))
+
+
+def read_transcript(path):
+    """cwd and entrypoint from the start of a transcript; latest titles from start and end."""
+    info = {}
+    try:
+        with open(path, "rb") as fh:
+            head, buf = 0, b""
+            while "cwd" not in info and head < HEAD_MAX:
+                chunk = fh.read(CHUNK)
+                if not chunk:
+                    break
+                head += len(chunk)
+                buf += chunk
+                lines = buf.split(b"\n")
+                buf = lines.pop()  # keep the unfinished line for the next chunk
+                _scan(b"\n".join(lines), info)
+            size = os.fstat(fh.fileno()).st_size
+            if "cwd" in info and size > head:
+                fh.seek(max(head, size - TAIL_BYTES))
+                _scan(fh.read(), info)
+    except OSError:
+        pass
     return info
 
 
 def in_temp_dir(cwd):
-    return any(cwd == t or cwd.startswith((t + "/", t + os.sep)) for t in TEMP_DIRS)
+    c = os.path.normcase(cwd)
+    return any(c == t or c.startswith((t + "/", t + os.sep)) for t in TEMP_DIRS)
 
 
 def recent_sessions():
-    running, dead, names = read_registry()
+    running, dead, user_names, other_names = read_registry()
     files = []
     for p in PROJECTS.glob("*/*.jsonl"):
         try:
@@ -172,33 +256,49 @@ def recent_sessions():
     sessions = []
     for mtime, p in files[:SCAN_LIMIT]:
         sid = p.stem
-        info = read_head(p)
+        if not SESSION_ID.match(sid):
+            continue
+        info = read_transcript(p)
         cwd = info.get("cwd")
         # Only sessions you ran yourself in a terminal, in folders that still exist.
         if info.get("entrypoint") != "cli" or not cwd or in_temp_dir(cwd):
             continue
         if not Path(cwd).is_dir():
             continue
-        title = names.get(sid) or info.get("title") or info.get("aiTitle") or Path(cwd).name
+        title = (user_names.get(sid) or info.get("title") or info.get("aiTitle")
+                 or other_names.get(sid) or clean_title(Path(cwd).name) or sid[:8])
+        # A leftover registry file only counts if nothing used the session after it:
+        # a later clean run (which removes its own file) means it wasn't open at the end.
+        last_seen = dead.get(sid)
+        was_open = last_seen is not None and mtime <= last_seen + 3600
         sessions.append({"id": sid, "cwd": cwd, "title": title, "mtime": mtime,
-                         "was_open": sid in dead, "running": sid in running})
+                         "was_open": was_open, "seen": max(last_seen or 0, mtime),
+                         "running": sid in running})
     return sessions
 
 
-def limit(sessions, count):
-    """All running sessions, then the `count` most recent ones that aren't running."""
-    live = [s for s in sessions if s["running"]]
-    rest = [s for s in sessions if not s["running"]][:count]
-    return live + rest
-
-
 def precheck(sessions):
-    """Indexes of sessions killed by the latest restart. Older leftovers come from
-    earlier crashes, so only count those within a few days of the newest one."""
-    dead = [s for s in sessions if s["was_open"] and not s["running"]]
-    cutoff = max((s["mtime"] for s in dead), default=0) - PRECHECK_DAYS * 86400
-    return {i for i, s in enumerate(sessions)
-            if s["was_open"] and not s["running"] and s["mtime"] >= cutoff}
+    """Ids of sessions that were most likely open when the machine went down."""
+    cands = [s for s in sessions if s["was_open"] and not s["running"]]
+    if not cands:
+        return set()
+    cutoff = max(s["seen"] for s in cands) - PRECHECK_DAYS * 86400
+    bt = boot_time()
+    if bt:
+        cutoff = max(cutoff, bt - MAX_AGE_DAYS * 86400)
+    return {s["id"] for s in cands if s["seen"] >= cutoff}
+
+
+def limit(sessions, count, keep):
+    """Running and pre-checked sessions, plus the `count` most recent others."""
+    out, others = [], 0
+    for s in sessions:
+        if s["running"] or s["id"] in keep:
+            out.append(s)
+        elif others < count:
+            out.append(s)
+            others += 1
+    return out
 
 
 def ago(ts):
@@ -212,7 +312,8 @@ def ago(ts):
 def pretty_path(cwd):
     cwd = re.sub(r"^/mnt/c/Users/[^/]+/", "C:~/", cwd)  # WSL view of the Windows profile
     home = str(Path.home())
-    if cwd == home or cwd.startswith(home + os.sep):
+    if os.path.normcase(cwd) == os.path.normcase(home) or \
+            os.path.normcase(cwd).startswith(os.path.normcase(home) + os.sep):
         cwd = "~" + cwd[len(home):]
     return cwd
 
@@ -251,45 +352,69 @@ def detect_terminal():
     die("couldn't find a terminal to open sessions in. Set CC_SESSION_RESTORE_TERMINAL.")
 
 
+def login_shell():
+    """Your login shell, run as a login+interactive shell so `claude` is on PATH
+    the same way it is when you open a terminal yourself."""
+    shell = None
+    try:
+        import pwd
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+    except Exception:
+        pass
+    shell = shell or os.environ.get("SHELL") or "/bin/bash"
+    if Path(shell).name in ("csh", "tcsh"):  # can't combine -l with -c
+        shell = "/bin/bash" if Path("/bin/bash").exists() else "/bin/sh"
+    return [shell, "-l", "-i", "-c"]
+
+
 def claude_cmd(s):
-    return f"{shlex.quote(CLAUDE_BIN)} --resume {s['id']} {CLAUDE_ARGS}".strip()
+    return f"{shlex.quote(CLAUDE_BIN)} --resume {shlex.quote(s['id'])} {CLAUDE_ARGS}".strip()
 
 
 def applescript_str(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def wt(args):
+    """Windows Terminal treats ';' as a command separator even inside arguments."""
+    return [a.replace(";", "\\;") for a in args]
+
+
 def launch_cmd(s, terminal):
     """-> (argv, popen kwargs) that open session s in a new tab/window."""
     cwd, title, inner = s["cwd"], s["title"], claude_cmd(s)
-    win_cmd = ["cmd", "/k", CLAUDE_BIN, "--resume", s["id"], *shlex.split(CLAUDE_ARGS)]
-    # POSIX: run through a login+interactive shell so `claude` is on PATH the
-    # same way it is when you open a terminal yourself.
-    shell = os.environ.get("SHELL") or "/bin/bash"
-    sh = [shell, "-lic", inner]
+    win_cmd = ["cmd", "/k", CLAUDE_BIN, "--resume", s["id"],
+               *shlex.split(CLAUDE_ARGS, posix=not IS_WINDOWS)]
 
     if terminal == "wsl":
         distro = os.environ.get("WSL_DISTRO_NAME") or die("--terminal wsl only works inside WSL")
-        return ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", title, "wsl.exe",
-                "-d", distro, "--cd", cwd, "--", "bash", "-lic", inner], {}
+        # -e runs the shell directly, so `inner` is interpreted once, by your shell.
+        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", title, "wsl.exe",
+                               "-d", distro, "--cd", cwd, "-e", *login_shell(), inner])], {}
     if terminal == "windows-terminal":
-        return ["wt.exe", "-w", WINDOW_NAME, "new-tab", "--title", title, "-d", cwd,
-                *win_cmd], {}
+        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", title, "-d", cwd,
+                               *win_cmd])], {}
     if terminal == "windows-console":
-        return win_cmd, {"cwd": cwd, "creationflags": 0x10}  # CREATE_NEW_CONSOLE
+        # No std handle redirection, or the new console gets no keyboard/screen.
+        return win_cmd, {"cwd": cwd, "creationflags": 0x10, "console": True}  # CREATE_NEW_CONSOLE
+
+    sh = [*login_shell(), inner]
     if terminal == "tmux":
         return ["tmux", "new-window", "-n", title, "-c", cwd, shlex.join(sh)], {}
+    cd_and_run = applescript_str("cd " + shlex.quote(cwd) + " && " + inner)
     if terminal == "macos-terminal":
-        script = (f'tell application "Terminal"\nactivate\n'
-                  f'do script {applescript_str("cd " + shlex.quote(cwd) + " && " + inner)}\nend tell')
+        script = ('set wasRunning to application "Terminal" is running\n'
+                  'tell application "Terminal"\nactivate\n'
+                  f'if wasRunning then\ndo script {cd_and_run}\n'
+                  f'else\ndelay 0.5\ndo script {cd_and_run} in window 1\nend if\nend tell')
         return ["osascript", "-e", script], {}
     if terminal == "iterm":
-        script = (
-            'tell application "iTerm2"\nactivate\n'
-            'if (count of windows) = 0 then\ncreate window with default profile\n'
-            'else\ntell current window to create tab with default profile\nend if\n'
-            f'tell current session of current window to write text '
-            f'{applescript_str("cd " + shlex.quote(cwd) + " && " + inner)}\nend tell')
+        script = ('set wasRunning to application "iTerm2" is running\n'
+                  'tell application "iTerm2"\nactivate\n'
+                  'if not wasRunning then delay 1\n'
+                  'if (count of windows) = 0 then\ncreate window with default profile\n'
+                  'else if wasRunning then\ntell current window to create tab with default profile\nend if\n'
+                  f'tell current session of current window to write text {cd_and_run}\nend tell')
         return ["osascript", "-e", script], {}
     linux = {
         "gnome-terminal": ["gnome-terminal", "--tab", "--title", title, "--working-directory", cwd, "--", *sh],
@@ -308,7 +433,9 @@ def launch_cmd(s, terminal):
 
 
 def launch(sessions, dry_run=False, terminal=None, log=print):
+    """Open each session. Returns a list of error messages (empty if all went well)."""
     terminal = terminal or detect_terminal()
+    errors = []
     for s in sessions:
         argv, kw = launch_cmd(s, terminal)
         if dry_run:
@@ -317,17 +444,34 @@ def launch(sessions, dry_run=False, terminal=None, log=print):
         if not shutil.which(argv[0]):
             die(f"'{argv[0]}' not found (terminal: {terminal}). Set CC_SESSION_RESTORE_TERMINAL.")
         log(f"  opening {s['title']}")
-        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, **kw)
+        console = kw.pop("console", False)
+        # stderr goes to a temp file, not a pipe: terminals like xterm keep running
+        # and would block once a pipe nobody reads fills up.
+        err_file = None if console else tempfile.TemporaryFile()
+        streams = {} if console else {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                                       "stderr": err_file}
+        try:
+            p = subprocess.Popen(argv, **streams, **kw)
+        except OSError as e:
+            errors.append(f"{s['title']}: {e}")
+            continue
         # Windows Terminal drops tabs that arrive too fast; others just keep order.
         time.sleep(0.8 if terminal in ("wsl", "windows-terminal") else 0.3)
+        # Launchers like tmux/osascript exit quickly; report it if one failed.
+        if not console:
+            if p.poll() not in (None, 0):
+                err_file.seek(0)
+                err = err_file.read().decode("utf-8", "replace").strip().splitlines()
+                errors.append(f"{s['title']}: {argv[0]} failed" + (f" ({err[-1]})" if err else ""))
+            err_file.close()
+    return errors
 
 
 # ---------------------------------------------------------------- text UI
 
 def show(sessions, selected):
     for i, s in enumerate(sessions, 1):
-        mark = "running" if s["running"] else ("[x]" if i - 1 in selected else "[ ]")
+        mark = "running" if s["running"] else ("[x]" if s["id"] in selected else "[ ]")
         print(f"  {mark:>7} {i:2}  {s['title'][:28]:<28}  {ago(s['mtime']):>9}  {pretty_path(s['cwd'])}")
 
 
@@ -340,17 +484,17 @@ def pick(sessions, selected):
             return []
         print()
         if ans == "":
-            return [sessions[i] for i in sorted(selected)]
+            return [s for s in sessions if s["id"] in selected]
         if ans == "q":
             return []
         if ans == "a":
-            selected = {i for i, s in enumerate(sessions) if not s["running"]}
+            selected = {s["id"] for s in sessions if not s["running"]}
         elif ans == "n":
             selected = set()
         else:
             for tok in ans.replace(",", " ").split():
-                if tok.isdigit() and 1 <= int(tok) <= len(sessions) and not sessions[int(tok) - 1]["running"]:
-                    selected ^= {int(tok) - 1}
+                if tok.isdecimal() and 1 <= int(tok) <= len(sessions) and not sessions[int(tok) - 1]["running"]:
+                    selected ^= {sessions[int(tok) - 1]["id"]}
 
 
 # ---------------------------------------------------------------- window (local web page)
@@ -361,10 +505,10 @@ PAGE = r"""<!doctype html>
 <title>Claude Code sessions</title>
 <style>
 :root { color-scheme:light dark; --bg:#f6f5f2; --card:#fff; --text:#1f1e1c; --muted:#6f6c66; --line:#e6e3dd;
-        --accent:#c96442; --accent-text:#fff; --hover:#faf8f5; --pill:#ecebe7; }
+        --accent:#c96442; --accent-text:#fff; --hover:#faf8f5; --pill:#ecebe7; --err:#b3261e; }
 @media (prefers-color-scheme: dark) {
   :root { --bg:#1c1b19; --card:#262522; --text:#ecebe7; --muted:#9c988f; --line:#363430;
-          --accent:#d97757; --accent-text:#1c1b19; --hover:#2d2b28; --pill:#363430; } }
+          --accent:#d97757; --accent-text:#1c1b19; --hover:#2d2b28; --pill:#363430; --err:#f2b8b5; } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--text);
        font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
@@ -376,6 +520,7 @@ h1 { font-size:22px; margin:0 0 4px; font-weight:650; }
        padding:12px 16px; border-top:1px solid var(--line); cursor:pointer; user-select:none; }
 .row:first-child { border-top:0; }
 .row:hover { background:var(--hover); }
+.row:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
 .row input { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; margin:0; }
 .title { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .folder { color:var(--muted); font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
@@ -387,6 +532,7 @@ h1 { font-size:22px; margin:0 0 4px; font-weight:650; }
 .row.running:hover { background:transparent; }
 .info { min-width:0; }
 .empty { padding:40px 16px; text-align:center; color:var(--muted); }
+.err { color:var(--err); }
 footer { position:fixed; left:0; right:0; bottom:0; background:color-mix(in srgb, var(--bg) 88%, transparent);
          backdrop-filter:blur(8px); border-top:1px solid var(--line); }
 footer .in { max-width:880px; margin:0 auto; padding:14px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
@@ -398,7 +544,8 @@ button.primary:disabled { opacity:.45; cursor:default; }
 .hint { color:var(--muted); font-size:13px; margin-left:auto; }
 .done { text-align:center; padding:80px 16px; }
 .done h1 { font-size:24px; }
-@media (max-width:560px) { .hint { display:none; } .meta .ago { display:block; } }
+.done ul { text-align:left; display:inline-block; }
+@media (max-width:560px) { .hint { display:none; } }
 </style></head>
 <body>
 <main id="app">
@@ -412,15 +559,15 @@ button.primary:disabled { opacity:.45; cursor:default; }
   <span class="hint">Enter opens checked &middot; double-click a row to open just that one</span>
 </div></footer>
 <script>
-const T = new URLSearchParams(location.search).get("t");
-let n = 15, rows = [], checked = new Set();
+let n = null, rows = [], checked = new Set(), known = new Set(), busy = false;
 const $ = id => document.getElementById(id);
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function toggle(id) { checked.has(id) ? checked.delete(id) : checked.add(id); render(id); }
 
-function render() {
+function render(focusId) {
   const list = $("list"); list.replaceChildren();
-  if (!rows.length) { list.append(el("div", "empty", "No Claude Code sessions found.")); }
+  if (!rows.length) list.append(el("div", "empty", "No Claude Code sessions found."));
   rows.forEach(s => {
     const r = el("div", "row" + (s.running ? " running" : ""));
     const box = el("input"); box.type = "checkbox"; box.disabled = s.running; box.checked = checked.has(s.id);
@@ -432,21 +579,35 @@ function render() {
     meta.append(el("span", "ago", s.ago));
     r.append(box, info, meta);
     if (!s.running) {
-      r.onclick = () => { checked.has(s.id) ? checked.delete(s.id) : checked.add(s.id); render(); };
+      r.tabIndex = 0;
+      r.onclick = () => toggle(s.id);
       r.ondblclick = () => openIds([s.id]);
+      r.onkeydown = e => { if (e.key === " ") { e.preventDefault(); toggle(s.id); } };
     }
     list.append(r);
+    if (s.id === focusId) r.focus();
   });
   const k = checked.size;
-  $("open").disabled = !k;
+  $("open").disabled = !k || busy;
   $("open").textContent = k ? `Open ${k} session${k > 1 ? "s" : ""}` : "Open";
 }
 
+function stopped() {
+  $("sub").replaceChildren(el("span", "err", "The picker has stopped (it closes after 15 idle minutes). Run it again."));
+  $("open").disabled = true;
+}
+
 async function load() {
-  const res = await fetch(`/api/sessions?t=${T}&n=${n}`);
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch("/api/sessions" + (n ? `?n=${n}` : ""));
+    if (!res.ok) throw new Error(res.status);
+    data = await res.json();
+  } catch (e) { return stopped(); }
+  n = data.count;
   rows = data.sessions;
-  checked = new Set(rows.filter(s => s.checked).map(s => s.id));
+  // Keep your own ticks; only pre-check sessions we haven't shown before.
+  rows.forEach(s => { if (!known.has(s.id)) { known.add(s.id); if (s.checked) checked.add(s.id); } });
   const live = rows.filter(s => s.running).length;
   $("sub").textContent = "Checked sessions were open when your machine went down." +
     (live ? ` ${live} already running (greyed out).` : "");
@@ -454,24 +615,34 @@ async function load() {
 }
 
 async function openIds(ids) {
-  if (!ids.length) return;
-  $("open").disabled = true;
-  const res = await fetch(`/api/open?t=${T}`, { method: "POST", body: JSON.stringify({ ids }) });
-  const data = await res.json();
+  if (!ids.length || busy) return;
+  busy = true; $("open").disabled = true;
+  let data;
+  try {
+    const res = await fetch("/api/open", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ ids }) });
+    data = await res.json();
+  } catch (e) { busy = false; return stopped(); }
   $("bar").remove();
   const app = $("app"); app.replaceChildren();
   const d = el("div", "done");
-  d.append(el("h1", null, data.error ? "Something went wrong" : `Opened ${data.opened} session${data.opened === 1 ? "" : "s"}`),
-           el("p", "sub", data.error || "You can close this tab."));
+  const errs = data.errors || [];
+  d.append(el("h1", null, data.error ? "Something went wrong" :
+                          `Opened ${data.opened} session${data.opened === 1 ? "" : "s"}`));
+  if (data.error) d.append(el("p", "sub err", data.error));
+  if (errs.length) { const ul = el("ul", "err"); errs.forEach(x => ul.append(el("li", null, x))); d.append(ul); }
+  if (!data.error && !errs.length) { d.append(el("p", "sub", "You can close this tab.")); setTimeout(() => window.close(), 1500); }
   app.append(d);
-  setTimeout(() => window.close(), 1500);
 }
 
 $("open").onclick = () => openIds([...checked]);
 $("all").onclick = () => { checked = new Set(rows.filter(s => !s.running).map(s => s.id)); render(); };
 $("none").onclick = () => { checked.clear(); render(); };
 $("more").onclick = () => { n += 25; load(); };
-document.addEventListener("keydown", e => { if (e.key === "Enter" && checked.size) openIds([...checked]); });
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.repeat) return;
+  if (e.target === document.body || e.target.classList.contains("row")) { e.preventDefault(); openIds([...checked]); }
+});
 load();
 </script>
 </body></html>
@@ -479,12 +650,13 @@ load();
 
 
 def sessions_payload(count):
-    sessions = limit(recent_sessions(), count)
-    checked = precheck(sessions)
-    return {"running": sum(s["running"] for s in sessions), "sessions": [
+    all_sessions = recent_sessions()
+    keep = precheck(all_sessions)
+    sessions = limit(all_sessions, count, keep)
+    return {"count": count, "running": sum(s["running"] for s in sessions), "sessions": [
         {"id": s["id"], "title": s["title"], "cwd": s["cwd"], "ago": ago(s["mtime"]),
-         "folder": pretty_path(s["cwd"]), "checked": i in checked, "running": s["running"]}
-        for i, s in enumerate(sessions)]}
+         "folder": pretty_path(s["cwd"]), "checked": s["id"] in keep, "running": s["running"]}
+        for s in sessions]}
 
 
 def open_in_browser(url):
@@ -499,72 +671,113 @@ def open_in_browser(url):
 def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
     """Serve the picker page on localhost until you open sessions or leave it idle."""
     import secrets
+    import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
-    token = secrets.token_urlsafe(16)  # so other web pages can't drive this server
-    state = {"done": False, "last": time.time()}
+    # The URL carries a one-time token (it may be visible in the browser's command
+    # line); the first page load swaps it for a cookie that the API then requires.
+    url_token, cookie = secrets.token_urlsafe(18), secrets.token_urlsafe(24)
+    state = {"done": False, "opening": False, "url_used": False, "last": time.time()}
+    lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
-        def send(self, code, body, ctype="application/json"):
+        def send(self, code, body, ctype="application/json", headers=()):
             data = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype + "; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(data)
 
-        def authorized(self):
-            state["last"] = time.time()
-            q = parse_qs(urlparse(self.path).query)
-            if q.get("t", [None])[0] != token:
-                self.send(403, '{"error": "bad token"}')
-                return None
-            return q
+        def host_ok(self):
+            # Blocks DNS rebinding: the browser must be talking to us by our own address.
+            return self.headers.get("Host") in (f"127.0.0.1:{srv_port}", f"localhost:{srv_port}")
+
+        def has_cookie(self):
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "ccsr" and secrets.compare_digest(v, cookie):
+                    return True
+            return False
 
         def do_GET(self):
-            q = self.authorized()
-            if q is None:
-                return
-            path = urlparse(self.path).path
-            if path == "/":
-                self.send(200, PAGE, "text/html")
-            elif path == "/api/sessions":
-                n = q.get("n", [str(count)])[0]
-                self.send(200, json.dumps(sessions_payload(int(n) if n.isdigit() else count)))
-            else:
-                self.send(404, '{"error": "not found"}')
+            if not self.host_ok():
+                return self.send(403, '{"error": "bad host"}')
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if u.path == "/":
+                t = q.get("t", [""])[0]
+                with lock:
+                    fresh = bool(t) and not state["url_used"] and secrets.compare_digest(t, url_token)
+                    if fresh:
+                        state["url_used"] = True
+                if fresh:
+                    state["last"] = time.time()
+                    return self.send(200, PAGE, "text/html", [(
+                        "Set-Cookie", f"ccsr={cookie}; Path=/; HttpOnly; SameSite=Strict")])
+                if self.has_cookie():
+                    state["last"] = time.time()
+                    return self.send(200, PAGE, "text/html")
+                return self.send(403, "This link has already been used. Run cc-session-restore --gui again.",
+                                 "text/plain")
+            if not self.has_cookie():
+                return self.send(403, '{"error": "not authorized"}')
+            state["last"] = time.time()
+            if u.path == "/api/sessions":
+                n = q.get("n", [""])[0]
+                n = int(n) if n.isdecimal() and len(n) < 6 else count
+                return self.send(200, json.dumps(sessions_payload(n)))
+            self.send(404, '{"error": "not found"}')
 
         def do_POST(self):
-            if self.authorized() is None:
-                return
+            if not self.host_ok() or not self.has_cookie():
+                return self.send(403, '{"error": "not authorized"}')
             if urlparse(self.path).path != "/api/open":
                 return self.send(404, '{"error": "not found"}')
+            state["last"] = time.time()
+            with lock:  # one open per picker: a double Enter must not resume twice
+                if state["opening"] or state["done"]:
+                    return self.send(409, '{"error": "already opening", "opened": 0}')
+                state["opening"] = True
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                ids = json.loads(self.rfile.read(length) or b"{}").get("ids") or []
+                length = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                ids = body.get("ids") if isinstance(body, dict) else None
+                ids = [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
                 by_id = {s["id"]: s for s in recent_sessions() if not s["running"]}
-                chosen = [by_id[i] for i in ids if i in by_id]
-                launch(chosen, terminal=terminal, log=lambda *_: None)
-                self.send(200, json.dumps({"opened": len(chosen)}))
+                chosen = [by_id[i] for i in dict.fromkeys(ids) if i in by_id]
+                errors = launch(chosen, terminal=terminal, log=lambda *_: None)
+                self.send(200, json.dumps({"opened": len(chosen) - len(errors), "errors": errors}))
                 state["done"] = True
             except SystemExit as e:  # die() inside launch
+                state["opening"] = False
                 self.send(200, json.dumps({"error": str(e), "opened": 0}))
             except Exception as e:
+                state["opening"] = False
                 self.send(500, json.dumps({"error": f"{type(e).__name__}: {e}", "opened": 0}))
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{srv.server_address[1]}/?t={token}"
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        die(f"can't listen on port {port} ({e.strerror}). Pick another with --port, "
+            "or leave it out to use any free port.")
+    srv_port = srv.server_address[1]
+    url = f"http://127.0.0.1:{srv_port}/?t={url_token}"
     print(f"cc-session-restore: {url}", flush=True)
     if browser:
         open_in_browser(url)
     srv.timeout = 0.5
     while not state["done"] and time.time() - state["last"] < idle_timeout:
         srv.handle_request()
+    time.sleep(0.2)  # let the last response finish
     srv.server_close()
 
 
@@ -582,13 +795,22 @@ def windows_shortcut(powershell, target, arguments, workdir):
                    cwd="/mnt/c" if IS_WSL and Path("/mnt/c").is_dir() else None)
 
 
+def desktop_quote(arg):
+    """Quote an argument for a .desktop Exec line (Desktop Entry spec)."""
+    for ch in ("\\", '"', "`", "$"):
+        arg = arg.replace(ch, "\\" + ch)
+    return '"' + arg.replace("%", "%%") + '"'
+
+
 def install():
     """Add a "Claude Code sessions" launcher that opens the picker page."""
     me = Path(__file__).resolve()
     if IS_WSL:
         # Start menu shortcut -> hidden PowerShell -> hidden wsl.exe -> this script.
-        # The command is base64-encoded so paths with spaces/quotes survive.
+        # The PowerShell command is base64-encoded so the shortcut needs no quoting.
         import base64
+        if '"' in str(me):
+            die('the folder path contains a double quote, which wsl.exe can\'t take. Move the repo.')
         distro = os.environ["WSL_DISTRO_NAME"]
         wsl_args = f'-d {distro} --cd "{me.parent}" -- python3 "./{me.name}" --gui'
         cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '{wsl_args.replace(chr(39), chr(39) * 2)}'"
@@ -614,12 +836,15 @@ def install():
         entry.write_text(
             "[Desktop Entry]\nType=Application\nName=Claude Code sessions\n"
             "Comment=Reopen your Claude Code sessions\n"
-            f"Exec={shlex.quote(sys.executable)} {shlex.quote(str(me))} --gui\n"
+            f"Exec={desktop_quote(sys.executable)} {desktop_quote(str(me))} --gui\n"
             "Icon=utilities-terminal\nTerminal=false\nCategories=Development;\n")
         print(f"Added app launcher: {entry}")
 
 
 # ---------------------------------------------------------------- main
+
+FAILED = []
+
 
 def main(argv):
     if "-h" in argv or "--help" in argv:
@@ -639,7 +864,7 @@ def main(argv):
 
     count = DEFAULT_COUNT
     if opt("-n") is not None:
-        if not opt("-n").isdigit():
+        if not opt("-n").isdecimal():
             die("-n needs a number")
         count = int(opt("-n"))
     terminal = opt("--terminal")
@@ -647,42 +872,50 @@ def main(argv):
 
     if "--gui" in argv:
         port = opt("--port")
-        run_gui(count, terminal, browser="--no-browser" not in argv,
-                port=int(port) if port and port.isdigit() else 0)
+        if port is not None and not (port.isdecimal() and int(port) < 65536):
+            die("--port needs a number below 65536")
+        run_gui(count, terminal, browser="--no-browser" not in argv, port=int(port or 0))
         return True
 
-    sessions = recent_sessions()
+    def report(errors):
+        for e in errors:
+            print(f"  failed: {e}", file=sys.stderr, flush=True)
+        if errors:
+            FAILED.append(True)
+        return not errors
+
     if "--open" in argv:
         ids = argv[argv.index("--open") + 1:]
-        by_id = {s["id"]: s for s in sessions if not s["running"]}
-        launch([by_id[i] for i in ids if i in by_id], dry_run, terminal)
-        return True
+        by_id = {s["id"]: s for s in recent_sessions() if not s["running"]}
+        return report(launch([by_id[i] for i in dict.fromkeys(ids) if i in by_id], dry_run, terminal))
 
-    sessions = limit(sessions, count)
     if "--json" in argv:
         print(json.dumps(sessions_payload(count)))
         return False
 
+    all_sessions = recent_sessions()
+    selected = precheck(all_sessions)
+    sessions = limit(all_sessions, count, selected)
     print("\ncc-session-restore - your most recent Claude Code sessions")
     print("[x] = was open when the machine went down    running = already open\n")
     if not sessions:
         print("No sessions found.")
         return False
-    selected = precheck(sessions)
     if "list" in argv:
         show(sessions, selected)
         return False
-    chosen = ([sessions[i] for i in sorted(selected)] if ("-y" in argv or "--yes" in argv)
-              else pick(sessions, selected))
+    if "-y" in argv or "--yes" in argv:
+        chosen = [s for s in all_sessions if s["id"] in selected]
+    else:
+        chosen = pick(sessions, selected)
     if not chosen:
         print("Nothing opened.")
         return False
-    launch(chosen, dry_run, terminal)
-    return True
+    return report(launch(chosen, dry_run, terminal))
 
 
 if __name__ == "__main__":
-    if hasattr(sys.stdout, "reconfigure"):
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # titles may have emoji
     opened = main([a for a in sys.argv[1:] if a != "--wait"])
     # Double-clicked from a file manager: keep the window up so you can read it.
@@ -691,3 +924,4 @@ if __name__ == "__main__":
             input("\nPress Enter to close.")
         except EOFError:
             pass
+    sys.exit(1 if FAILED else 0)
