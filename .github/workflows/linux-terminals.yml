@@ -1,0 +1,119 @@
+name: Linux terminals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terminal:
+    name: ${{ matrix.terminal }}${{ matrix.konsole_single && ' (single process)' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # windows: how many the two sessions should end up in (1 = the second became a tab).
+          - { terminal: gnome-terminal, packages: gnome-terminal, title: "1", class: gnome-terminal, windows: 1 }
+          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 2 }
+          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 1, konsole_single: "1" }
+          - { terminal: xfce4-terminal, packages: xfce4-terminal, title: "1", class: xfce4-terminal, windows: 1 }
+          - { terminal: kitty, packages: kitty, title: "1", class: kitty, windows: 2 }
+          - { terminal: wezterm, packages: wezterm, title: "", class: "", windows: "" }  # checked with `wezterm cli list`
+          - { terminal: alacritty, packages: alacritty, title: "1", class: alacritty, windows: 2 }
+          - { terminal: x-terminal-emulator, packages: xterm, title: "1", class: xterm, windows: 2 }
+          - { terminal: xterm, packages: xterm, title: "1", class: xterm, windows: 2 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Add the wezterm apt repository
+        if: matrix.terminal == 'wezterm'
+        run: |
+          # wezterm doesn't publish this key's fingerprint; this is the one apt.fury.io/wez
+          # served when this workflow was written (Wez Furlong <gemfury@wez.wezfurlong.org>).
+          expected=0CA603116C960BAFB2BF310BD7BA31CF90C4B319
+          curl -fsSL https://apt.fury.io/wez/gpg.key -o wezterm.key
+          got=$(gpg --show-keys --with-colons wezterm.key | awk -F: '$1 == "fpr" { print $10; exit }')
+          [ "$got" = "$expected" ] || { echo "wezterm apt key fingerprint is $got, expected $expected"; exit 1; }
+          sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg wezterm.key
+          echo 'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list
+      - name: Install ${{ matrix.packages }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth xdotool dbus dbus-x11 \
+            mesa-utils libgl1-mesa-dri openbox ${{ matrix.packages }}
+      - name: Launch two sessions
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          CHECK_TITLE: ${{ matrix.title }}
+          WM_CLASS: ${{ matrix.class }}
+          WINDOWS: ${{ matrix.windows }}
+          KONSOLE_SINGLE: ${{ matrix.konsole_single }}
+        # A window manager, so windows get focus as on a desktop: --tab/--new-tab add
+        # the tab to the focused window, and open a new one if nothing has focus.
+        run: |
+          xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- \
+            bash -c 'openbox & sleep 2; exec bash tests/linux_terminals.sh "$1"' _ "${{ matrix.terminal }}"
+
+  desktop-file:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install desktop-file-utils and gio
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends desktop-file-utils libglib2.0-bin python3-venv
+      - name: --install from a folder with awkward characters, validate, launch with gio
+        run: |
+          set -euo pipefail
+          weird="$HOME/we ird \$x \`b\` \"q\" 'a' back\\slash 50%f"
+          mkdir -p "$weird"
+          cp cc-session-restore "$weird/"
+          python3 -m venv "$weird/venv"
+          export XDG_DATA_HOME="$HOME/xdg"
+          "$weird/venv/bin/python3" "$weird/cc-session-restore" --install
+          entry="$XDG_DATA_HOME/applications/cc-session-restore.desktop"
+          cat "$entry"
+          desktop-file-validate "$entry"
+          # GLib looks for the program before undoing %%, so it can't launch from a
+          # folder with % in it (desktop-file-validate above covers the quoting of %).
+          plain="$HOME/we ird \$x \`b\` \"q\" 'a' back\\slash"
+          mv "$weird" "$plain"
+          weird=$plain
+          python3 -m venv --clear "$weird/venv"
+          "$weird/venv/bin/python3" "$weird/cc-session-restore" --install
+          cat "$entry"
+          desktop-file-validate "$entry"
+          # Swap the script for one that records how it was started, then let GLib launch it.
+          printf '%s\n' '#!/usr/bin/env python3' 'import json, os, sys' \
+            'json.dump([sys.executable, sys.argv], open(os.path.expanduser("~/launched.json"), "w"))' \
+            > "$weird/cc-session-restore"
+          gio launch "$entry"
+          for _ in $(seq 40); do [ -e ~/launched.json ] && break; sleep 0.5; done
+          cat ~/launched.json; echo
+          python3 - "$weird" <<'EOF'
+          import json, os, sys
+          weird = sys.argv[1]
+          exe, argv = json.load(open(os.path.expanduser("~/launched.json")))
+          assert exe == weird + "/venv/bin/python3", exe
+          assert argv == [weird + "/cc-session-restore", "--gui"], argv
+          print("ok: the launcher runs", argv)
+          EOF
+      - name: --install refuses paths a .desktop file can't hold
+        run: |
+          set -uo pipefail
+          for dir in "$HOME/line
+          break" "$HOME/$(printf 'bad\xff')"; do
+            mkdir -p "$dir" && cp cc-session-restore "$dir/"
+            msg=$(XDG_DATA_HOME="$HOME/xdg2" python3 "$dir/cc-session-restore" --install 2>&1) && status=0 || status=$?
+            echo "$msg"
+            [ "$status" = 1 ] && [[ "$msg" == "cc-session-restore: "*"Move it." ]] || exit 1
+            [ ! -e "$HOME/xdg2" ] || exit 1
+          done

@@ -68,6 +68,8 @@ Sessions open in the first match:
 | macOS | iTerm2 (tabs) if you use it or have it installed, else Terminal.app (a window per session) |
 | Linux | the terminal you're in (WezTerm, kitty, Konsole, GNOME Terminal), else the first installed of gnome-terminal, konsole, xfce4-terminal, kitty, wezterm, alacritty, x-terminal-emulator, xterm |
 
+On Linux, xfce4-terminal and WezTerm open each session in a new tab. GNOME Terminal does that only when you run cc-session-restore from inside GNOME Terminal, and Konsole only with "Run all Konsole windows in a single process" turned on. Otherwise, and in kitty, Alacritty and xterm, each session gets its own window.
+
 To pick one yourself, use `--terminal NAME` or set `CC_SESSION_RESTORE_TERMINAL`. Run `--help` for the full list of names.
 
 ### Settings
@@ -88,7 +90,7 @@ It only reads files Claude Code already keeps on your machine. Nothing is sent a
 - **Old leftovers aren't pre-checked:**
   - files from earlier crashes, more than a week older than the newest leftover or more than two weeks before the last boot;
   - files for sessions that were used again afterwards.
-- **Reopening:** each session runs `claude --resume <session-id>` in its original folder, in a new terminal tab.
+- **Reopening:** each session runs `claude --resume <session-id>` in its original folder, in a new terminal tab or window.
 
 Only sessions you started yourself in a terminal are listed. SDK and background runs, and sessions whose folder no longer exists, are skipped.
 
@@ -96,7 +98,7 @@ Only sessions you started yourself in a terminal are listed. SDK and background 
 
 - **This depends on Claude Code's internal files.** The session registry and transcript layout aren't a public API and may change in any release. If the list comes up empty or wrong, include the output of `cc-session-restore doctor` in your bug report. It reports the environment, registry field changes and why transcripts were skipped. The default output hides paths, session titles and IDs. Use `doctor --verbose` locally to see paths, titles and unknown field names, and review those details before sharing them.
 - **Pre-checking is a best guess.** It relies on Claude Code cleaning up its own files. Uncheck anything you don't want.
-- **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested. The macOS, native Windows and other Linux terminal launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
+- **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested, and the Linux terminal launchers are run on CI (headless, under Xvfb). The macOS and native Windows launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
 
 ## Contributing
 
