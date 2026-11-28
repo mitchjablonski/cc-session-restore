@@ -46,14 +46,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xauth xdotool dbus dbus-x11 \
-            mesa-utils libgl1-mesa-dri ${{ matrix.packages }}
+            mesa-utils libgl1-mesa-dri openbox ${{ matrix.packages }}
       - name: Launch two sessions
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
           CHECK_TITLE: ${{ matrix.title }}
           WM_CLASS: ${{ matrix.class }}
           WINDOWS: ${{ matrix.windows }}
-        run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- bash tests/linux_terminals.sh "${{ matrix.terminal }}"
+        # A window manager, so windows get focus as on a desktop: --tab/--new-tab add
+        # the tab to the focused window, and open a new one if nothing has focus.
+        run: |
+          xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- \
+            bash -c 'openbox & sleep 2; exec bash tests/linux_terminals.sh "$1"' _ "${{ matrix.terminal }}"
 
   desktop-file:
     runs-on: ubuntu-latest
@@ -106,8 +110,7 @@ jobs:
           for dir in "$HOME/line
           break" "$HOME/$(printf 'bad\xff')"; do
             mkdir -p "$dir" && cp cc-session-restore "$dir/"
-            msg=$(XDG_DATA_HOME="$HOME/xdg2" python3 "$dir/cc-session-restore" --install 2>&1)
-            status=$?
+            msg=$(XDG_DATA_HOME="$HOME/xdg2" python3 "$dir/cc-session-restore" --install 2>&1) && status=0 || status=$?
             echo "$msg"
             [ "$status" = 1 ] && [[ "$msg" == "cc-session-restore: "*"Move it." ]] || exit 1
             [ ! -e "$HOME/xdg2" ] || exit 1
