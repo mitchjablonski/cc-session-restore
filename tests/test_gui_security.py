@@ -78,10 +78,15 @@ class GuiSecurityTest(unittest.TestCase):
         self.assertNotEqual(self.token, "__CCSR_TOKEN__")
 
     def stop_server(self):
-        # A valid open ends the server loop; it also shows rejected requests didn't use up the open.
-        if self.thread.is_alive():
-            self.request("POST", "/api/open", json.dumps({"ids": []}), self.good_headers())
-            self.thread.join(10)
+        # A valid open ends the server loop. If the test already opened sessions, the
+        # server is shutting down, and another POST could hit a closing socket
+        # (ConnectionResetError), so just wait for it.
+        if not self.launched:
+            # Nothing opened yet: this open must succeed, which also shows rejected
+            # requests didn't use up the one open.
+            status, _, _ = self.request("POST", "/api/open", json.dumps({"ids": []}), self.good_headers())
+            self.assertEqual(status, 200)
+        self.thread.join(10)
         self.assertFalse(self.thread.is_alive())
 
     def request(self, method, path, body=None, headers=None):

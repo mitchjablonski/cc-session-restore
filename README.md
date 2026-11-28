@@ -54,9 +54,11 @@ If you cloned it, it's also handy on your PATH: `ln -s "$PWD/cc-session-restore"
 
 Open **Claude Code sessions**, or run `cc-session-restore --gui`. A page opens in your browser:
 
-- **Checked** sessions were open when the machine went down. Click **Open** (or press Enter) to reopen them.
-- **Greyed-out** sessions are already running, so they can't be opened twice.
-- Click a row (or press Space on it) to toggle it. **Double-click** a row to open just that one session.
+- **Ticked** sessions were open when the machine went down. Click **Open** (or press Enter) to reopen them.
+- Sessions marked **running** are already open, so they can't be opened twice.
+- Click a row (or press Space on it) to tick or untick it. **Double-click** a row to open just that one session.
+- Type in **Filter** (or press `/`) to show only sessions whose title or folder matches. Esc clears it. Hidden rows stay ticked, and the **Open** button says how many of them are hidden.
+- Up and Down move between rows, and Home and End jump to the first and last.
 - If a session fails to open, the page says which one and why.
 
 The page is served on `127.0.0.1` only. Its link works once and is swapped for a private cookie. That first load also gives the page a second per-run secret, kept only in that browser tab, which every request must carry. Browsers share cookies across local ports, so a server on another port could receive the cookie, but without the secret it can't list or open sessions. The page can't be shown in a frame on another site. It shuts down after you open sessions, or after 15 minutes idle.

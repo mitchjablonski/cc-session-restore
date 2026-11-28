@@ -688,62 +688,91 @@ PAGE = r"""<!doctype html>
 <meta name="ccsr-token" content="__CCSR_TOKEN__">
 <title>Claude Code sessions</title>
 <style>
-:root { color-scheme:light dark; --bg:#f6f5f2; --card:#fff; --text:#1f1e1c; --muted:#6f6c66; --line:#e6e3dd;
-        --accent:#c96442; --accent-text:#fff; --hover:#faf8f5; --pill:#ecebe7; --err:#b3261e; }
+/* Text colours meet WCAG AA (4.5:1) and the focus ring and box borders 3:1, in both themes. */
+:root { color-scheme:light dark; --bg:#f6f5f2; --card:#fff; --text:#1f1e1c; --muted:#5f5c57; --line:#e6e3dd;
+        --box:#8a8680; --accent:#b0502f; --accent-text:#fff; --hover:#f3f1ec; --pill:#ecebe7; --err:#b3261e; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#1c1b19; --card:#262522; --text:#ecebe7; --muted:#9c988f; --line:#363430;
-          --accent:#d97757; --accent-text:#1c1b19; --hover:#2d2b28; --pill:#363430; --err:#f2b8b5; } }
+  :root { --bg:#1c1b19; --card:#262522; --text:#ecebe7; --muted:#a8a49b; --line:#3a3834;
+          --box:#8f8b83; --accent:#d97757; --accent-text:#1c1b19; --hover:#2f2d2a; --pill:#3a3834; --err:#f2b8b5; } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--text);
        font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
 main { max-width:880px; margin:0 auto; padding:32px 16px 110px; }
 h1 { font-size:22px; margin:0 0 4px; font-weight:650; }
-.sub { color:var(--muted); margin:0 0 20px; }
+.sub { color:var(--muted); margin:0 0 16px; }
+.tools { display:flex; gap:12px; align-items:center; margin:0 0 12px; flex-wrap:wrap; }
+.tools label { font-weight:600; }
+#filter { font:inherit; flex:1 1 220px; max-width:420px; padding:7px 10px; border-radius:8px;
+          border:1px solid var(--box); background:var(--card); color:var(--text); }
+#filter::placeholder { color:var(--muted); opacity:1; }
+#status { color:var(--muted); font-size:13px; }
 .list { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+.list[hidden] { display:none; }
 .row { display:grid; grid-template-columns:28px 1fr auto; gap:12px; align-items:center;
        padding:12px 16px; border-top:1px solid var(--line); cursor:pointer; user-select:none; }
-.row:first-child { border-top:0; }
+.row[hidden] { display:none; }
+.row.first { border-top:0; }
 .row:hover { background:var(--hover); }
-.row:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
-.row input { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; margin:0; }
+.row:focus { outline:none; }
+.row:focus-visible { outline:3px solid var(--accent); outline-offset:-3px; }
+.box { width:18px; height:18px; border:2px solid var(--box); border-radius:4px; display:grid; place-items:center; }
+.row[aria-selected="true"] .box { background:var(--accent); border-color:var(--accent); }
+.row[aria-selected="true"] .box::after { content:""; width:5px; height:9px; margin-top:-2px;
+       border:solid var(--accent-text); border-width:0 2px 2px 0; transform:rotate(45deg); }
 .title { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .folder { color:var(--muted); font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
           overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .meta { color:var(--muted); font-size:13px; text-align:right; white-space:nowrap; }
 .pill { display:inline-block; background:var(--pill); border-radius:999px; padding:1px 9px;
         font-size:12px; margin-right:8px; color:var(--muted); }
-.row.running { cursor:default; opacity:.55; }
-.row.running:hover { background:transparent; }
+.row.running { cursor:default; }
+.row.running .title { color:var(--muted); font-weight:500; }
+.row.running .box { border-style:dashed; }
 .info { min-width:0; }
-.empty { padding:40px 16px; text-align:center; color:var(--muted); }
+.empty { padding:40px 16px; text-align:center; color:var(--muted); background:var(--card);
+         border:1px solid var(--line); border-radius:12px; margin:0; }
+.empty:empty, #alert:empty { display:none; }
 .err { color:var(--err); }
-footer { position:fixed; left:0; right:0; bottom:0; background:color-mix(in srgb, var(--bg) 88%, transparent);
-         backdrop-filter:blur(8px); border-top:1px solid var(--line); }
+#alert { margin:0 0 12px; font-weight:600; }
+footer { position:fixed; left:0; right:0; bottom:0; background:var(--bg); border-top:1px solid var(--line); }
 footer .in { max-width:880px; margin:0 auto; padding:14px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 button { font:inherit; border-radius:8px; padding:8px 14px; cursor:pointer;
-         border:1px solid var(--line); background:var(--card); color:var(--text); }
+         border:1px solid var(--box); background:var(--card); color:var(--text); }
 button:hover { background:var(--hover); }
 button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-text); font-weight:600; }
 button.primary:disabled { opacity:.45; cursor:default; }
+button:focus-visible, #filter:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+kbd { font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; border:1px solid var(--box);
+      border-radius:4px; padding:0 4px; }
 .hint { color:var(--muted); font-size:13px; margin-left:auto; }
 .done { text-align:center; padding:80px 16px; }
 .done h1 { font-size:24px; }
+.done h1:focus { outline:none; }
 .done ul { text-align:left; display:inline-block; }
-@media (max-width:560px) { .hint { display:none; } }
+@media (max-width:720px) { .hint { display:none; } }
 </style></head>
 <body>
 <main id="app">
   <h1>Claude Code sessions</h1>
   <p class="sub" id="sub">Loading...</p>
-  <div class="list" id="list"></div>
+  <div class="tools">
+    <label for="filter">Filter</label>
+    <input id="filter" type="search" autocomplete="off" spellcheck="false" placeholder="Title or folder"
+           aria-describedby="status" aria-controls="list" aria-keyshortcuts="/">
+    <span id="status" role="status" aria-live="polite"></span>
+  </div>
+  <p id="alert" class="err" role="alert"></p>
+  <div class="list" id="list" role="listbox" aria-multiselectable="true" aria-label="Sessions" hidden></div>
+  <p class="empty" id="empty"></p>
 </main>
 <footer id="bar"><div class="in">
   <button class="primary" id="open" disabled>Open</button>
   <button id="all">All</button><button id="none">None</button><button id="more">Show more</button>
-  <span class="hint">Enter opens checked &middot; double-click a row to open just that one</span>
+  <span class="hint"><kbd>/</kbd> filter &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> move &middot;
+    <kbd>Space</kbd> tick &middot; <kbd>Enter</kbd> opens ticked</span>
 </div></footer>
 <script>
-let n = null, rows = [], checked = new Set(), known = new Set(), busy = false;
+let n = null, rows = [], checked = new Set(), known = new Set(), busy = false, active = null;
 const $ = id => document.getElementById(id);
 // Per-run secret every /api call must send back. The server embeds it only in the
 // first (one-time link) load; keep it in sessionStorage, which is per-tab and
@@ -757,37 +786,80 @@ const TOKEN = (() => {
 })();
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-function toggle(id) { checked.has(id) ? checked.delete(id) : checked.add(id); render(id); }
+const plural = (k, word) => `${k} ${word}${k === 1 ? "" : "s"}`;
+const rowEls = () => [...$("list").children];
+const shown = () => rowEls().filter(r => !r.hidden);
+const rowFor = id => rowEls().find(r => r.dataset.id === id);
+const isRow = t => !!(t && t.classList && t.classList.contains("row"));
+const session = r => rows.find(s => s.id === r.dataset.id);
 
-function render(focusId) {
-  const list = $("list"); list.replaceChildren();
-  if (!rows.length) list.append(el("div", "empty", "No Claude Code sessions found."));
-  rows.forEach(s => {
+// Roving focus: exactly one visible row is in the tab order.
+function setActive(r, focus) {
+  rowEls().forEach(x => { x.tabIndex = -1; });
+  active = r ? r.dataset.id : null;
+  if (!r) return;
+  r.tabIndex = 0;
+  if (focus) { r.focus(); r.scrollIntoView({ block: "nearest" }); }
+}
+
+function toggle(r) {
+  const s = session(r);
+  if (!s || s.running) return;
+  checked.has(s.id) ? checked.delete(s.id) : checked.add(s.id);
+  r.setAttribute("aria-selected", String(checked.has(s.id)));
+  update();
+}
+
+function build() {
+  $("list").replaceChildren(...rows.map(s => {
     const r = el("div", "row" + (s.running ? " running" : ""));
-    const box = el("input"); box.type = "checkbox"; box.disabled = s.running; box.checked = checked.has(s.id);
-    box.tabIndex = -1;
+    r.dataset.id = s.id;
+    r.setAttribute("role", "option");
+    r.setAttribute("aria-selected", String(checked.has(s.id)));
+    if (s.running) r.setAttribute("aria-disabled", "true");
+    const box = el("span", "box"); box.setAttribute("aria-hidden", "true");
     const info = el("div", "info");
     info.append(el("div", "title", s.title), el("div", "folder", s.folder));
     const meta = el("div", "meta");
     if (s.running) meta.append(el("span", "pill", "running"));
     meta.append(el("span", "ago", s.ago));
     r.append(box, info, meta);
-    if (!s.running) {
-      r.tabIndex = 0;
-      r.onclick = () => toggle(s.id);
-      r.ondblclick = () => openIds([s.id]);
-      r.onkeydown = e => { if (e.key === " ") { e.preventDefault(); toggle(s.id); } };
-    }
-    list.append(r);
-    if (s.id === focusId) r.focus();
-  });
-  const k = checked.size;
-  $("open").disabled = !k || busy;
-  $("open").textContent = k ? `Open ${k} session${k > 1 ? "s" : ""}` : "Open";
+    return r;
+  }));
+  applyFilter();
 }
 
+// Hiding a row never unticks it; the Open button and the status line count hidden ticks.
+function applyFilter() {
+  const q = $("filter").value.trim().toLowerCase();
+  rowEls().forEach(r => {
+    const s = session(r);
+    r.hidden = !!q && !(s.title + "\n" + s.folder).toLowerCase().includes(q);
+  });
+  const vis = shown();
+  vis.forEach((r, i) => r.classList.toggle("first", i === 0));
+  $("list").hidden = !vis.length;
+  const cur = active && rowFor(active);
+  setActive(cur && !cur.hidden ? cur : vis[0] || null, false);
+  $("empty").textContent = !rows.length ? "No Claude Code sessions found." :
+                           !vis.length ? "No sessions match the filter." : "";
+  update();
+}
+
+function update() {
+  const k = checked.size;
+  const visible = new Set(shown().map(r => r.dataset.id));
+  const hidden = [...checked].filter(id => !visible.has(id)).length;
+  $("open").disabled = !k || busy;
+  $("open").textContent = !k ? "Open" : `Open ${plural(k, "session")}` + (hidden ? ` (${hidden} hidden)` : "");
+  $("status").textContent = ($("filter").value.trim() ? `${visible.size} of ${rows.length} shown. ` : "") +
+    `${k} ticked` + (hidden ? `, ${hidden} hidden by the filter.` : ".");
+}
+
+function clearFilter() { $("filter").value = ""; applyFilter(); }
+
 function stopped() {
-  $("sub").replaceChildren(el("span", "err", "The picker has stopped (it closes after 15 idle minutes). Run it again."));
+  $("alert").textContent = "The picker has stopped (it closes after 15 idle minutes). Run it again.";
   $("open").disabled = true;
 }
 
@@ -798,14 +870,17 @@ async function load() {
     if (!res.ok) throw new Error(res.status);
     data = await res.json();
   } catch (e) { return stopped(); }
+  const hadFocus = isRow(document.activeElement);
   n = data.count;
   rows = data.sessions;
   // Keep your own ticks; only pre-check sessions we haven't shown before.
   rows.forEach(s => { if (!known.has(s.id)) { known.add(s.id); if (s.checked) checked.add(s.id); } });
   const live = rows.filter(s => s.running).length;
-  $("sub").textContent = "Checked sessions were open when your machine went down." +
-    (live ? ` ${live} already running (greyed out).` : "");
-  render();
+  $("sub").textContent = "Ticked sessions were open when your machine went down." +
+    (live === 1 ? " 1 is already running, so it can't be opened again." :
+     live ? ` ${live} are already running, so they can't be opened again.` : "");
+  build();
+  if (hadFocus && active) setActive(rowFor(active), true);
 }
 
 async function openIds(ids) {
@@ -821,21 +896,56 @@ async function openIds(ids) {
   const app = $("app"); app.replaceChildren();
   const d = el("div", "done");
   const errs = data.errors || [];
-  d.append(el("h1", null, data.error ? "Something went wrong" :
-                          `Opened ${data.opened} session${data.opened === 1 ? "" : "s"}`));
-  if (data.error) d.append(el("p", "sub err", data.error));
-  if (errs.length) { const ul = el("ul", "err"); errs.forEach(x => ul.append(el("li", null, x))); d.append(ul); }
-  if (!data.error && !errs.length) { d.append(el("p", "sub", "You can close this tab.")); setTimeout(() => window.close(), 1500); }
+  const h = el("h1", null, data.error ? "Something went wrong" : `Opened ${plural(data.opened, "session")}`);
+  h.tabIndex = -1;
+  const msg = el("div"); msg.setAttribute("role", data.error || errs.length ? "alert" : "status");
+  if (data.error) msg.append(el("p", "sub err", data.error));
+  if (errs.length) { const ul = el("ul", "err"); errs.forEach(x => ul.append(el("li", null, x))); msg.append(ul); }
+  if (!data.error && !errs.length) { msg.append(el("p", "sub", "You can close this tab.")); setTimeout(() => window.close(), 1500); }
+  d.append(h, msg);
   app.append(d);
+  h.focus();
 }
 
-$("open").onclick = () => openIds([...checked]);
-$("all").onclick = () => { checked = new Set(rows.filter(s => !s.running).map(s => s.id)); render(); };
-$("none").onclick = () => { checked.clear(); render(); };
-$("more").onclick = () => { n += 25; load(); };
+$("open").addEventListener("click", () => openIds([...checked]));
+// All and None act on the rows the filter shows.
+$("all").addEventListener("click", () => {
+  shown().forEach(r => { const s = session(r); if (!s.running) checked.add(s.id); });
+  build();
+});
+$("none").addEventListener("click", () => { shown().forEach(r => checked.delete(r.dataset.id)); build(); });
+$("more").addEventListener("click", () => { n += 25; load(); });
+$("filter").addEventListener("input", applyFilter);
+$("list").addEventListener("click", e => {
+  const r = e.target.closest(".row");
+  if (r) { setActive(r, true); toggle(r); }
+});
+$("list").addEventListener("dblclick", e => {
+  const r = e.target.closest(".row");
+  if (r && !session(r).running) openIds([r.dataset.id]);
+});
+
 document.addEventListener("keydown", e => {
+  const t = e.target, inFilter = t === $("filter"), onRow = isRow(t);
+  if (e.key === "Escape" && $("filter").value) { e.preventDefault(); clearFilter(); return; }
+  if (e.key === "/" && !inFilter && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault(); $("filter").focus(); $("filter").select(); return;
+  }
+  const nav = ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key);
+  if (nav && (onRow || t === document.body || (inFilter && e.key === "ArrowDown"))) {
+    const vis = shown();
+    if (!vis.length) return;
+    e.preventDefault();
+    const i = onRow ? vis.indexOf(t) : -1;
+    const j = e.key === "Home" ? 0 : e.key === "End" ? vis.length - 1 :
+              e.key === "ArrowDown" ? Math.min(i + 1, vis.length - 1) : (i < 0 ? 0 : Math.max(i - 1, 0));
+    setActive(vis[j], true);
+    return;
+  }
+  if (e.key === " " && onRow) { e.preventDefault(); toggle(t); return; }
+  // Enter opens only from the page itself or a row, never from a button or the filter box.
   if (e.key !== "Enter" || e.repeat) return;
-  if (e.target === document.body || e.target.classList.contains("row")) { e.preventDefault(); openIds([...checked]); }
+  if (t === document.body || onRow) { e.preventDefault(); openIds([...checked]); }
 });
 load();
 </script>
