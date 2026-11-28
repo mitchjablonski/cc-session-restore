@@ -19,6 +19,8 @@ Thanks for helping. Bug reports, fixes and reports from platforms we haven't tes
 
 The tool opens terminal windows and a browser for real. While you work on it, point it at fake data and a fake `claude`, and keep it away from your desktop.
 
+The unit tests do this for you and run on CI: `python3 -m unittest discover -s tests`. Don't run `--install`, `--autostart` or `--uninstall` on your own machine to test them. They write to your real Start menu, Startup folder, app menu or LaunchAgents. `tests/test_install.py` covers them with a fake HOME and APPDATA.
+
 ### 1. A fake config folder
 
 `CLAUDE_CONFIG_DIR` tells the tool where to find Claude Code's files. Make a small one:

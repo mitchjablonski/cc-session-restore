@@ -46,9 +46,26 @@ Run it with the same Python, on the same side (Windows or WSL), as your Claude C
 | Linux | App menu entry (`~/.local/share/applications`) |
 | macOS | `~/Applications/Claude Code sessions.command` (drag it to the Dock) |
 
-To have the picker open automatically when you log in, copy that launcher into your startup items. On Windows, that's the `shell:startup` folder.
-
 If you cloned it, it's also handy on your PATH: `ln -s "$PWD/cc-session-restore" ~/.local/bin/`
+
+### Open at login
+
+```bash
+cc-session-restore --install --autostart
+```
+
+This also adds a login entry that runs `cc-session-restore --gui --only-if-restorable`. That opens the picker only if at least one session is pre-checked, meaning it was open when the machine went down. After a normal shutdown it exits quietly, so a normal boot shows nothing.
+
+| Where Claude Code runs | Login entry |
+|---|---|
+| WSL | Windows Startup folder shortcut (`shell:startup`), using the same hidden launcher as the Start menu one |
+| Windows | Startup folder shortcut (`shell:startup`) |
+| Linux | `~/.config/autostart/cc-session-restore.desktop` |
+| macOS | LaunchAgent `~/Library/LaunchAgents/com.github.mitchjablonski.cc-session-restore.plist` (RunAtLoad) |
+
+`cc-session-restore --uninstall` removes the launcher and the login entry. Running `--install` again without `--autostart` leaves an existing login entry in place. Add `--dry-run` to `--install` or `--uninstall` to see what it would add or remove without changing anything. `--only-if-restorable` implies `--gui`.
+
+On WSL the shortcuts go in the Windows `%APPDATA%` folder, which is looked up with `cmd.exe`. If that fails, set `APPDATA` to its Linux path, e.g. `/mnt/c/Users/<you>/AppData/Roaming`.
 
 ## Use
 
