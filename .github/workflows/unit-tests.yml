@@ -1,0 +1,36 @@
+# Runs the stdlib unittest suite in tests/. The tests use fake HOME, APPDATA and
+# Claude Code data, and replace the browser, terminal and shortcut writers.
+name: unit tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} (${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.8", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+
+      - name: Run the tests with Python ${{ matrix.python }}
+        run: |
+          uv python install "${{ matrix.python }}"
+          "$(uv python find '${{ matrix.python }}')" -m unittest discover -s tests -v
