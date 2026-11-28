@@ -685,6 +685,7 @@ def pick(sessions, selected):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="ccsr-token" content="__CCSR_TOKEN__">
 <title>Claude Code sessions</title>
 <style>
 :root { color-scheme:light dark; --bg:#f6f5f2; --card:#fff; --text:#1f1e1c; --muted:#6f6c66; --line:#e6e3dd;
@@ -744,6 +745,16 @@ button.primary:disabled { opacity:.45; cursor:default; }
 <script>
 let n = null, rows = [], checked = new Set(), known = new Set(), busy = false;
 const $ = id => document.getElementById(id);
+// Per-run secret every /api call must send back. The server embeds it only in the
+// first (one-time link) load; keep it in sessionStorage, which is per-tab and
+// per-origin (so per-port), for reloads of this tab.
+const TOKEN = (() => {
+  const t = document.querySelector('meta[name="ccsr-token"]').content;
+  try {
+    if (t) sessionStorage.setItem("ccsr-token", t);
+    return t || sessionStorage.getItem("ccsr-token") || "";
+  } catch (e) { return t; }
+})();
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function toggle(id) { checked.has(id) ? checked.delete(id) : checked.add(id); render(id); }
@@ -783,7 +794,7 @@ function stopped() {
 async function load() {
   let data;
   try {
-    const res = await fetch("/api/sessions" + (n ? `?n=${n}` : ""));
+    const res = await fetch("/api/sessions" + (n ? `?n=${n}` : ""), { headers: { "X-CCSR-Token": TOKEN } });
     if (!res.ok) throw new Error(res.status);
     data = await res.json();
   } catch (e) { return stopped(); }
@@ -802,7 +813,7 @@ async function openIds(ids) {
   busy = true; $("open").disabled = true;
   let data;
   try {
-    const res = await fetch("/api/open", { method: "POST", headers: { "Content-Type": "application/json" },
+    const res = await fetch("/api/open", { method: "POST", headers: { "Content-Type": "application/json", "X-CCSR-Token": TOKEN },
                                            body: JSON.stringify({ ids }) });
     data = await res.json();
   } catch (e) { busy = false; return stopped(); }
@@ -860,7 +871,20 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
 
     # The URL carries a one-time token (it may be visible in the browser's command
     # line); the first page load swaps it for a cookie that the API then requires.
-    url_token, cookie = secrets.token_urlsafe(18), secrets.token_urlsafe(24)
+    # Cookies aren't isolated by port, so a server on another local port that the
+    # browser visits receives that cookie and could replay it. So the API also needs a
+    # second secret in an X-CCSR-Token header. It is embedded only in the response to
+    # the one-time link (the page keeps it in per-origin sessionStorage for reloads);
+    # loading the page with just the cookie serves it without the secret.
+    url_token, cookie, api_token = (secrets.token_urlsafe(18), secrets.token_urlsafe(24),
+                                    secrets.token_urlsafe(24))
+    first_page = PAGE.replace("__CCSR_TOKEN__", api_token)
+    later_page = PAGE.replace("__CCSR_TOKEN__", "")
+
+    def same(a, b):
+        # compare_digest raises on non-ASCII str; compare bytes so odd input is just "no".
+        return secrets.compare_digest(a.encode("utf-8", "surrogateescape"),
+                                      b.encode("utf-8", "surrogateescape"))
     state = {"done": False, "opening": False, "url_used": False, "last": time.time()}
     lock = threading.Lock()
 
@@ -875,6 +899,8 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")  # no clickjacking via a frame
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
@@ -884,34 +910,44 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
             # Blocks DNS rebinding: the browser must be talking to us by our own address.
             return self.headers.get("Host") in (f"127.0.0.1:{srv_port}", f"localhost:{srv_port}")
 
+        def origin_ok(self):
+            # Browsers send Origin on cross-origin and on POST requests; when present it must be us.
+            origin = self.headers.get("Origin")
+            return origin is None or origin in (f"http://127.0.0.1:{srv_port}", f"http://localhost:{srv_port}")
+
+        def api_ok(self):
+            token = self.headers.get("X-CCSR-Token") or ""
+            return (self.host_ok() and self.origin_ok() and self.has_cookie()
+                    and same(token, api_token))
+
         def has_cookie(self):
             for part in (self.headers.get("Cookie") or "").split(";"):
                 k, _, v = part.strip().partition("=")
-                if k == "ccsr" and secrets.compare_digest(v, cookie):
+                if k == "ccsr" and same(v, cookie):
                     return True
             return False
 
         def do_GET(self):
-            if not self.host_ok():
-                return self.send(403, '{"error": "bad host"}')
+            if not self.host_ok() or not self.origin_ok():
+                return self.send(403, '{"error": "bad host or origin"}')
             u = urlparse(self.path)
             q = parse_qs(u.query)
             if u.path == "/":
                 t = q.get("t", [""])[0]
                 with lock:
-                    fresh = bool(t) and not state["url_used"] and secrets.compare_digest(t, url_token)
+                    fresh = bool(t) and not state["url_used"] and same(t, url_token)
                     if fresh:
                         state["url_used"] = True
                 if fresh:
                     state["last"] = time.time()
-                    return self.send(200, PAGE, "text/html", [(
+                    return self.send(200, first_page, "text/html", [(
                         "Set-Cookie", f"ccsr={cookie}; Path=/; HttpOnly; SameSite=Strict")])
                 if self.has_cookie():
                     state["last"] = time.time()
-                    return self.send(200, PAGE, "text/html")
+                    return self.send(200, later_page, "text/html")
                 return self.send(403, "This link has already been used. Run cc-session-restore --gui again.",
                                  "text/plain")
-            if not self.has_cookie():
+            if not self.api_ok():
                 return self.send(403, '{"error": "not authorized"}')
             state["last"] = time.time()
             if u.path == "/api/sessions":
@@ -921,8 +957,12 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
             self.send(404, '{"error": "not found"}')
 
         def do_POST(self):
-            if not self.host_ok() or not self.has_cookie():
+            if not self.api_ok():
                 return self.send(403, '{"error": "not authorized"}')
+            # A JSON body can't be sent cross-origin without a CORS preflight, which we never allow.
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return self.send(415, '{"error": "expected application/json"}')
             if urlparse(self.path).path != "/api/open":
                 return self.send(404, '{"error": "not found"}')
             state["last"] = time.time()

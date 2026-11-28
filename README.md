@@ -43,7 +43,7 @@ Open **Claude Code sessions**, or run `cc-session-restore --gui`. A page opens i
 - Click a row (or press Space on it) to toggle it. **Double-click** a row to open just that one session.
 - If a session fails to open, the page says which one and why.
 
-The page is served on `127.0.0.1` only. Its link works once and is swapped for a private cookie, so other programs and web pages can't use it. It shuts down after you open sessions, or after 15 minutes idle.
+The page is served on `127.0.0.1` only. Its link works once and is swapped for a private cookie. That first load also gives the page a second per-run secret, kept only in that browser tab, which every request must carry. Browsers share cookies across local ports, so a server on another port could receive the cookie, but without the secret it can't list or open sessions. The page can't be shown in a frame on another site. It shuts down after you open sessions, or after 15 minutes idle.
 
 ### In the terminal
 
