@@ -31,6 +31,7 @@ FAKE = [{"id": "sess-1", "title": "t", "cwd": "/tmp", "mtime": 0, "running": Fal
 class GuiSecurityTest(unittest.TestCase):
     def setUp(self):
         self.launched = []
+        self.opened = False  # set once any /api/open has succeeded
         url_seen = threading.Event()
         urls = []
 
@@ -78,10 +79,15 @@ class GuiSecurityTest(unittest.TestCase):
         self.assertNotEqual(self.token, "__CCSR_TOKEN__")
 
     def stop_server(self):
-        # A valid open ends the server loop; it also shows rejected requests didn't use up the open.
-        if self.thread.is_alive():
-            self.request("POST", "/api/open", json.dumps({"ids": []}), self.good_headers())
-            self.thread.join(10)
+        # A valid open ends the server loop. If the test already had one succeed, the
+        # server is shutting down, and another POST could hit a closing socket
+        # (ConnectionResetError), so just wait for it.
+        if not self.opened:
+            # Nothing opened yet: this open must succeed, which also shows rejected
+            # requests didn't use up the one open.
+            status, _, _ = self.request("POST", "/api/open", json.dumps({"ids": []}), self.good_headers())
+            self.assertEqual(status, 200)
+        self.thread.join(10)
         self.assertFalse(self.thread.is_alive())
 
     def request(self, method, path, body=None, headers=None):
@@ -89,6 +95,8 @@ class GuiSecurityTest(unittest.TestCase):
         try:
             conn.request(method, path, body=body, headers=headers or {})
             res = conn.getresponse()
+            if method == "POST" and path == "/api/open" and res.status == 200:
+                self.opened = True
             return res.status, res.headers, res.read().decode("utf-8")
         finally:
             conn.close()
@@ -197,6 +205,13 @@ class GuiSecurityTest(unittest.TestCase):
             body = json.dumps({"ids": ["sess-1"]}) if method == "POST" else None
             self.assertEqual(self.request(method, path, body, headers)[0], 403, (path, headers))
         self.assertEqual(self.launched, [])
+
+    def test_page_js_detaches_key_handler_on_result_screen(self):
+        # The result screen removes the list and filter; the key handler must go with them.
+        self.assertIn('document.addEventListener("keydown", onKey)', ccsr.PAGE)
+        body = re.search(r"async function openIds\(ids\) \{(.*?)\n\}", ccsr.PAGE, re.S).group(1)
+        self.assertLess(body.index('document.removeEventListener("keydown", onKey)'),
+                        body.index("app.replaceChildren()"))
 
     def test_page_js_sends_token_on_every_fetch(self):
         fetches = re.findall(r"fetch\((.*?)\);", ccsr.PAGE, re.S)
