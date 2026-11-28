@@ -419,7 +419,9 @@ def launch_cmd(s, terminal):
     linux = {
         # --opt=value, so a title starting with "-" isn't taken for an option.
         "gnome-terminal": ["gnome-terminal", "--tab", f"--title={title}", f"--working-directory={cwd}", "--", *sh],
-        "konsole": ["konsole", "--new-tab", "--workdir", cwd, "-e", *sh],
+        # Konsole expands $VARS in --workdir, so cd in the shell too.
+        "konsole": ["konsole", "--new-tab", "--workdir", cwd, "-e", *login_shell(),
+                    f"cd {shlex.quote(cwd)} && {inner}"],
         "xfce4-terminal": ["xfce4-terminal", "--tab", f"--title={title}", f"--working-directory={cwd}", "-x", *sh],
         "kitty": ["kitty", f"--directory={cwd}", f"--title={title}", *sh],
         "wezterm": (["wezterm", "cli", "spawn", "--cwd", cwd, "--", *sh] if os.environ.get("WEZTERM_PANE")
