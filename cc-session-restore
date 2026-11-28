@@ -6,7 +6,8 @@ Unofficial; not affiliated with Anthropic. Works on macOS, Linux, Windows and WS
   cc-session-restore              interactive picker in the terminal
   cc-session-restore --gui        the same, as a page in your browser
                                   (--no-browser just prints the URL; --port N picks the port;
-                                  --only-if-restorable exits quietly unless one is pre-checked)
+                                  --only-if-restorable exits quietly unless one is pre-checked,
+                                  and implies --gui)
   cc-session-restore list         just print the list
   cc-session-restore doctor       print a diagnostic report for bug reports
                                   (--verbose includes private paths, titles and field names)
@@ -18,6 +19,8 @@ Unofficial; not affiliated with Anthropic. Works on macOS, Linux, Windows and WS
                                   (--autostart also adds a login entry that opens the picker
                                   only when a session was open when the machine went down)
   cc-session-restore --uninstall  remove the launcher and the login entry
+                                  (with --dry-run, --install and --uninstall only print
+                                  what they would add or remove)
   cc-session-restore --json       machine-readable list
   cc-session-restore --open ID... open these sessions by id
 
@@ -1018,20 +1021,39 @@ AUTOSTART_FLAGS = "--gui --only-if-restorable"
 def windows_programs_dir():
     """The Windows Start menu 'Programs' folder (shell:programs); Startup is inside it."""
     appdata = os.environ.get("APPDATA", "")
-    if IS_WSL and not appdata.startswith("/"):  # WSLENV=APPDATA/p already gives a Linux path
-        cwd = "/mnt/c" if Path("/mnt/c").is_dir() else None
+    if IS_WSL and not appdata.startswith("/"):  # WSLENV=APPDATA/p gives a Linux path
+        win = appdata if WINDOWS_ABS.match(appdata) else wsl_windows_appdata()
         try:
-            if not appdata:
-                appdata = subprocess.run(["cmd.exe", "/c", "echo %APPDATA%"], capture_output=True,
-                                         text=True, cwd=cwd, timeout=30).stdout.strip()
-                appdata = "" if "%" in appdata else appdata  # unset: cmd echoes it back
-            appdata = subprocess.run(["wslpath", "-u", appdata], capture_output=True,
-                                     text=True, timeout=30).stdout.strip() if appdata else ""
-        except (OSError, subprocess.SubprocessError):
-            appdata = ""
-    if not appdata:
-        die("can't find the Windows %APPDATA% folder.")
+            appdata = subprocess.run(["wslpath", "-u", win], capture_output=True,
+                                     timeout=30).stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            die(f"can't convert %APPDATA% ({win}) with wslpath: {e}")
+        if not (appdata.startswith("/") and Path(appdata).is_dir()):
+            die(f"%APPDATA% is {win!r}, but wslpath turned it into {appdata!r}, which isn't a "
+                "folder. Set APPDATA to its Linux path (e.g. /mnt/c/Users/<you>/AppData/Roaming) "
+                "and try again.")
+    elif not (appdata and os.path.isabs(appdata)):
+        die(f"%APPDATA% is {appdata!r}, not an absolute path: can't find the Start menu folder.")
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+
+
+WINDOWS_ABS = re.compile(r"^[A-Za-z]:\\")
+
+
+def wsl_windows_appdata():
+    """%APPDATA% as Windows sees it, e.g. 'C:\\Users\\you\\AppData\\Roaming'."""
+    try:
+        # /d skips cmd's AutoRun; a Windows cwd avoids the "UNC paths are not supported" note.
+        out = subprocess.run(["cmd.exe", "/d", "/c", "echo %APPDATA%"], capture_output=True,
+                             timeout=30, cwd="/mnt/c" if Path("/mnt/c").is_dir() else None).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        die(f"can't ask cmd.exe for %APPDATA%: {e}")
+    lines = [l.strip() for l in out.decode("utf-8", "replace").splitlines() if l.strip()]
+    win = lines[-1] if lines else ""
+    if not WINDOWS_ABS.match(win):
+        die(f"cmd.exe gave {win!r} for %APPDATA%, not a Windows path like C:\\... "
+            "Set APPDATA to its Linux path (e.g. /mnt/c/Users/<you>/AppData/Roaming) and try again.")
+    return win
 
 
 def windows_shortcut(lnk, powershell, target, arguments, workdir):
@@ -1107,9 +1129,10 @@ def desktop_entry(python, me, flags, extra=""):
             f"Icon=utilities-terminal\nTerminal=false\n{extra}")
 
 
-def install(autostart=False):
+def install(autostart=False, dry_run=False):
     """Add a "Claude Code sessions" launcher that opens the picker page, and with
-    `autostart` a login entry that opens it only when there's something to restore."""
+    `autostart` a login entry that opens it only when there's something to restore.
+    With `dry_run`, print what would be written and touch nothing."""
     # The launcher runs this file with this interpreter. Under pipx or
     # `uv tool install` these are the tool venv's bin/cc-session-restore (the
     # PATH entry is a symlink to it, which resolve() follows) and its python;
@@ -1133,49 +1156,61 @@ def install(autostart=False):
             if "\n" in path or "\r" in path:
                 die(f"{path!r} contains a line break, which a .desktop file can't hold. Move it.")
     launcher, login = install_paths()
+
+    def add(path, what, write, show):
+        if dry_run:
+            print(f"Would add {what}: {path}\n    " + show.rstrip("\n").replace("\n", "\n    "))
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write()
+        print(f"Added {what}: {path}")
+
     if IS_WSL or IS_WINDOWS:
-        windows_shortcut(launcher, *windows_launcher(me, python, "--gui"))
-        print(f"Added {'Windows ' if IS_WSL else ''}Start menu shortcut: Claude Code sessions")
-        if autostart:
-            windows_shortcut(login, *windows_launcher(me, python, AUTOSTART_FLAGS))
-            print(f"Added {'Windows ' if IS_WSL else ''}Startup shortcut: Claude Code sessions")
+        win = "Windows " if IS_WSL else ""
+        for path, what, flags in ((launcher, f"{win}Start menu shortcut", "--gui"),
+                                  (login, f"{win}Startup shortcut", AUTOSTART_FLAGS)):
+            if path == login and not autostart:
+                break
+            spec = windows_launcher(me, python, flags)
+            add(path, what, lambda path=path, spec=spec: windows_shortcut(path, *spec),
+                f"{spec[1]} {spec[2]}")
     elif IS_MAC:
-        launcher.parent.mkdir(exist_ok=True)
-        launcher.write_text(f"#!/bin/sh\nexec {shlex.quote(python)} {shlex.quote(str(me))} --gui\n")
-        launcher.chmod(0o755)
-        print(f"Added {launcher}\n(double-click it, or drag it to the Dock)")
+        script = f"#!/bin/sh\nexec {shlex.quote(python)} {shlex.quote(str(me))} --gui\n"
+
+        def write_command():
+            launcher.write_text(script)
+            launcher.chmod(0o755)
+        add(launcher, "launcher (double-click it, or drag it to the Dock)", write_command, script)
         if autostart:
             import plistlib
-            login.parent.mkdir(parents=True, exist_ok=True)
-            with open(login, "wb") as f:
-                plistlib.dump({"Label": LAUNCH_AGENT, "RunAtLoad": True,
-                               "ProgramArguments": [python, str(me)] + AUTOSTART_FLAGS.split()}, f)
-            print(f"Added LaunchAgent: {login}")
+            plist = plistlib.dumps({"Label": LAUNCH_AGENT, "RunAtLoad": True,
+                                    "ProgramArguments": [python, str(me)] + AUTOSTART_FLAGS.split()})
+            add(login, "LaunchAgent", lambda: login.write_bytes(plist), plist.decode())
     else:
-        launcher.parent.mkdir(parents=True, exist_ok=True)
-        launcher.write_text(desktop_entry(python, me, "--gui", "Categories=Development;\n"),
-                            encoding="utf-8")
-        print(f"Added app launcher: {launcher}")
-        if autostart:
-            login.parent.mkdir(parents=True, exist_ok=True)
-            login.write_text(desktop_entry(python, me, AUTOSTART_FLAGS,
-                                           "X-GNOME-Autostart-enabled=true\n"), encoding="utf-8")
-            print(f"Added autostart entry: {login}")
-    if autostart:
+        for path, what, flags, extra in (
+                (launcher, "app launcher", "--gui", "Categories=Development;\n"),
+                (login, "autostart entry", AUTOSTART_FLAGS, "X-GNOME-Autostart-enabled=true\n")):
+            if path == login and not autostart:
+                break
+            text = desktop_entry(python, me, flags, extra)
+            add(path, what, lambda path=path, text=text: path.write_text(text, encoding="utf-8"), text)
+    if autostart and not dry_run:
         print("At login it opens the picker only if a session was open when the machine went down.")
 
 
-def uninstall():
-    """Remove what --install and --install --autostart added."""
-    removed = False
+def uninstall(dry_run=False):
+    """Remove what --install and --install --autostart added (with `dry_run`, just say so)."""
+    found = False
     for path in install_paths():
-        try:
-            path.unlink()
-        except FileNotFoundError:
+        if not (path.exists() or path.is_symlink()):
             continue
+        found = True
+        if dry_run:
+            print(f"Would remove {path}")
+            continue
+        path.unlink()
         print(f"Removed {path}")
-        removed = True
-    if not removed:
+    if not found:
         print("Nothing to remove: no launcher or autostart entry found.")
 
 
@@ -1204,10 +1239,10 @@ def main(argv):
         doctor(verbose="--verbose" in argv)
         return False
     if "--uninstall" in argv:
-        uninstall()
+        uninstall(dry_run="--dry-run" in argv)
         return False
     if "--install" in argv:
-        install(autostart="--autostart" in argv)
+        install(autostart="--autostart" in argv, dry_run="--dry-run" in argv)
         return False
     if "--autostart" in argv:
         die("--autostart goes with --install")
@@ -1228,7 +1263,7 @@ def main(argv):
     terminal = opt("--terminal")
     dry_run = "--dry-run" in argv
 
-    if "--gui" in argv:
+    if "--gui" in argv or "--only-if-restorable" in argv:  # the latter implies --gui
         port = opt("--port")
         if port is not None and not (port.isdecimal() and int(port) < 65536):
             die("--port needs a number below 65536")

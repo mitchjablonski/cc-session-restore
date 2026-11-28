@@ -228,6 +228,183 @@ class LinuxInstallTests(InstallTestCase):
         self.assertFalse((self.home / ".config").exists())
 
 
+class DryRunTests(InstallTestCase):
+    def tree(self):
+        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
+
+    def check_install_dry_run(self, flag_text):
+        before = self.tree()
+        _, out = self.run_main("--install", "--autostart", "--dry-run")
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.shortcuts, [])
+        self.assertEqual(out.count("Would add "), 2)
+        self.assertNotIn("Added", out)
+        self.assertIn(flag_text, out)
+        return out
+
+    def test_linux_install_dry_run_writes_nothing(self):
+        self.platform()
+        out = self.check_install_dry_run("--gui --only-if-restorable")
+        self.assertIn(str(self.home / ".config/autostart/cc-session-restore.desktop"), out)
+
+    def test_mac_install_dry_run_writes_nothing(self):
+        self.platform(mac=True)
+        out = self.check_install_dry_run("<string>--only-if-restorable</string>")
+        self.assertIn("RunAtLoad", out)
+
+    def test_windows_install_dry_run_writes_nothing(self):
+        self.platform(windows=True)
+        self.check_install_dry_run("--gui --only-if-restorable")
+
+    def test_wsl_install_dry_run_writes_nothing(self):
+        self.platform(wsl=True)
+        os.environ["WSL_DISTRO_NAME"] = "FakeDistro"
+        out = self.check_install_dry_run("-EncodedCommand")
+        self.assertIn("Startup", out)
+
+    def test_install_dry_run_without_autostart(self):
+        self.platform()
+        _, out = self.run_main("--install", "--dry-run")
+        self.assertEqual(out.count("Would add "), 1)
+        self.assertEqual(self.tree(), sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*")))
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_uninstall_dry_run_removes_nothing(self):
+        for kw in ({}, {"mac": True}, {"windows": True}):
+            with self.subTest(**kw):
+                for name in ("IS_WSL", "IS_WINDOWS", "IS_MAC"):
+                    setattr(self.m, name, False)
+                self.platform(**kw)
+                paths = self.m.install_paths()
+                for p in paths:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.touch()
+                _, out = self.run_main("--uninstall", "--dry-run")
+                self.assertTrue(all(p.exists() for p in paths))
+                self.assertEqual(out.count("Would remove "), 2)
+                self.assertNotIn("Removed", out)
+
+
+STUB_CMD = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_CMD_LOG"], "a") as f:
+    f.write(json.dumps([sys.argv[1:], os.getcwd()]) + "\n")
+with open(os.environ["FAKE_CMD_OUT"], "rb") as f:
+    sys.stdout.buffer.write(f.read())
+'''
+STUB_WSLPATH = r'''#!/usr/bin/env python3
+import os, sys
+mode, path = sys.argv[1], sys.argv[2]
+assert mode == "-u", mode
+if len(path) > 2 and path[1] == ":":
+    path = os.environ["FAKE_DRIVES"] + "/" + path[0].lower() + path[2:].replace("\\", "/")
+sys.stdout.buffer.write(path.encode("utf-8", "surrogateescape") + b"\n")
+'''
+
+
+class WslAppdataTests(InstallTestCase):
+    """windows_programs_dir() on WSL with stub cmd.exe and wslpath on PATH."""
+
+    def setUp(self):
+        super().setUp()
+        self.platform(wsl=True)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        for name, text in (("cmd.exe", STUB_CMD), ("wslpath", STUB_WSLPATH)):
+            (bin_dir / name).write_text(text)
+            (bin_dir / name).chmod(0o755)
+        self.out_file, self.log = self.root / "cmd-out", self.root / "cmd-log"
+        self.drives = self.root / "drives"
+        del os.environ["APPDATA"]
+        os.environ.update({"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                           "FAKE_CMD_OUT": str(self.out_file), "FAKE_CMD_LOG": str(self.log),
+                           "FAKE_DRIVES": str(self.drives)})
+
+    def cmd_says(self, data):
+        self.out_file.write_bytes(data)
+
+    def roaming(self, user="fake"):
+        d = self.drives / "c" / "Users" / user / "AppData" / "Roaming"
+        d.mkdir(parents=True)
+        return d
+
+    def programs(self):
+        try:
+            return self.m.windows_programs_dir()
+        except SystemExit as e:
+            self.die_message = str(e.code)
+            raise
+
+    def cmd_calls(self):
+        return [json.loads(l)[0] for l in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def test_plain_output(self):
+        roaming = self.roaming()
+        self.cmd_says(b"C:\\Users\\fake\\AppData\\Roaming\r\n")
+        self.assertEqual(self.programs(), roaming / "Microsoft/Windows/Start Menu/Programs")
+        self.assertEqual(self.cmd_calls(), [["/d", "/c", "echo %APPDATA%"]])
+
+    def test_banner_before_the_path(self):
+        roaming = self.roaming()
+        self.cmd_says(b"Microsoft Windows [Version 10.0.0]\r\n(c) Fake banner\r\n\r\n"
+                      b"C:\\Users\\fake\\AppData\\Roaming\r\n\r\n")
+        self.assertEqual(self.programs(), roaming / "Microsoft/Windows/Start Menu/Programs")
+
+    def test_garbage(self):
+        self.cmd_says(b"\x00\xff garbage %APPDATA%\r\n")
+        with self.assertRaises(SystemExit):
+            self.programs()
+        self.assertIn("not a Windows path", self.die_message)
+
+    def test_unset_variable_is_echoed_back(self):
+        self.cmd_says(b"%APPDATA%\r\n")
+        with self.assertRaises(SystemExit):
+            self.programs()
+
+    def test_relative_path(self):
+        self.cmd_says(b"Users\\fake\\AppData\\Roaming\r\n")
+        with self.assertRaises(SystemExit):
+            self.programs()
+
+    def test_non_ascii_utf8(self):
+        roaming = self.roaming("J\u00f6rg")
+        self.cmd_says("C:\\Users\\J\u00f6rg\\AppData\\Roaming\r\n".encode("utf-8"))
+        self.assertEqual(self.programs(), roaming / "Microsoft/Windows/Start Menu/Programs")
+
+    def test_non_ascii_oem_code_page_does_not_crash(self):
+        self.roaming("J\u00f6rg")
+        self.cmd_says("C:\\Users\\J\u00f6rg\\AppData\\Roaming\r\n".encode("cp850"))
+        with self.assertRaises(SystemExit):  # a clear die(), not a UnicodeDecodeError
+            self.programs()
+        self.assertIn("Set APPDATA", self.die_message)
+
+    def test_wslpath_result_must_exist(self):
+        self.cmd_says(b"C:\\Users\\nobody\\AppData\\Roaming\r\n")
+        with self.assertRaises(SystemExit):
+            self.programs()
+        self.assertIn("isn't a folder", self.die_message)
+
+    def test_windows_form_appdata_skips_cmd(self):
+        roaming = self.roaming()
+        os.environ["APPDATA"] = "C:\\Users\\fake\\AppData\\Roaming"
+        self.assertEqual(self.programs(), roaming / "Microsoft/Windows/Start Menu/Programs")
+        self.assertEqual(self.cmd_calls(), [])
+
+    def test_relative_appdata_is_ignored(self):
+        roaming = self.roaming()
+        os.environ["APPDATA"] = "relative/appdata"
+        self.cmd_says(b"C:\\Users\\fake\\AppData\\Roaming\r\n")
+        self.assertEqual(self.programs(), roaming / "Microsoft/Windows/Start Menu/Programs")
+        self.assertEqual(len(self.cmd_calls()), 1)
+
+    def test_native_windows_needs_absolute_appdata(self):
+        self.m.IS_WSL, self.m.IS_WINDOWS = False, True
+        os.environ["APPDATA"] = "relative/appdata"
+        with self.assertRaises(SystemExit):
+            self.programs()
+        self.assertEqual(self.cmd_calls(), [])
+
+
 class OnlyIfRestorableTests(InstallTestCase):
     def session(self, was_open):
         project = self.root / "project"
@@ -266,6 +443,17 @@ class OnlyIfRestorableTests(InstallTestCase):
         self.session(was_open=False)
         self.run_main("--gui", "--no-browser")
         self.assertEqual(len(self.gui_runs), 1)
+
+    def test_only_if_restorable_implies_gui(self):
+        self.session(was_open=True)
+        with mock.patch.object(self.m, "is_alive", lambda d: False):
+            self.run_main("--only-if-restorable", "--no-browser")
+        self.assertEqual(len(self.gui_runs), 1)
+
+    def test_only_if_restorable_alone_exits_silently(self):
+        self.session(was_open=False)
+        result, out = self.run_main("--only-if-restorable")
+        self.assertEqual((result, out, self.gui_runs), (False, "", []))
 
     def test_exit_code_is_zero(self):
         # Real process, empty config: exits before serving. --no-browser in case it didn't.

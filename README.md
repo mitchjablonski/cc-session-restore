@@ -63,7 +63,9 @@ This also adds a login entry that runs `cc-session-restore --gui --only-if-resto
 | Linux | `~/.config/autostart/cc-session-restore.desktop` |
 | macOS | LaunchAgent `~/Library/LaunchAgents/com.github.mitchjablonski.cc-session-restore.plist` (RunAtLoad) |
 
-`cc-session-restore --uninstall` removes the launcher and the login entry. Running `--install` again without `--autostart` leaves an existing login entry in place.
+`cc-session-restore --uninstall` removes the launcher and the login entry. Running `--install` again without `--autostart` leaves an existing login entry in place. Add `--dry-run` to `--install` or `--uninstall` to see what it would add or remove without changing anything. `--only-if-restorable` implies `--gui`.
+
+On WSL the shortcuts go in the Windows `%APPDATA%` folder, which is looked up with `cmd.exe`. If that fails, set `APPDATA` to its Linux path, e.g. `/mnt/c/Users/<you>/AppData/Roaming`.
 
 ## Use
 
