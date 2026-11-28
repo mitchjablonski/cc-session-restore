@@ -852,7 +852,11 @@ function update() {
   const hidden = [...checked].filter(id => !visible.has(id)).length;
   $("open").disabled = !k || busy;
   $("open").textContent = !k ? "Open" : `Open ${plural(k, "session")}` + (hidden ? ` (${hidden} hidden)` : "");
-  $("status").textContent = ($("filter").value.trim() ? `${visible.size} of ${rows.length} shown. ` : "") +
+  const filtered = !!$("filter").value.trim();
+  // All and None act on the rows the filter shows, so say so while it hides some.
+  $("all").textContent = filtered ? "Tick shown" : "All";
+  $("none").textContent = filtered ? "Untick shown" : "None";
+  $("status").textContent = (filtered ? `${visible.size} of ${rows.length} shown. ` : "") +
     `${k} ticked` + (hidden ? `, ${hidden} hidden by the filter.` : ".");
 }
 
@@ -893,6 +897,7 @@ async function openIds(ids) {
     data = await res.json();
   } catch (e) { busy = false; return stopped(); }
   $("bar").remove();
+  document.removeEventListener("keydown", onKey);  // the list and filter are gone
   const app = $("app"); app.replaceChildren();
   const d = el("div", "done");
   const errs = data.errors || [];
@@ -908,7 +913,6 @@ async function openIds(ids) {
 }
 
 $("open").addEventListener("click", () => openIds([...checked]));
-// All and None act on the rows the filter shows.
 $("all").addEventListener("click", () => {
   shown().forEach(r => { const s = session(r); if (!s.running) checked.add(s.id); });
   build();
@@ -925,7 +929,7 @@ $("list").addEventListener("dblclick", e => {
   if (r && !session(r).running) openIds([r.dataset.id]);
 });
 
-document.addEventListener("keydown", e => {
+function onKey(e) {
   const t = e.target, inFilter = t === $("filter"), onRow = isRow(t);
   if (e.key === "Escape" && $("filter").value) { e.preventDefault(); clearFilter(); return; }
   if (e.key === "/" && !inFilter && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -946,7 +950,8 @@ document.addEventListener("keydown", e => {
   // Enter opens only from the page itself or a row, never from a button or the filter box.
   if (e.key !== "Enter" || e.repeat) return;
   if (t === document.body || onRow) { e.preventDefault(); openIds([...checked]); }
-});
+}
+document.addEventListener("keydown", onKey);
 load();
 </script>
 </body></html>
