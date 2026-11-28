@@ -97,6 +97,10 @@ Only sessions you started yourself in a terminal are listed. SDK and background 
 - **Pre-checking is a best guess.** It relies on Claude Code cleaning up its own files. Uncheck anything you don't want.
 - **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested. The macOS, native Windows and other Linux terminal launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
 
+## Contributing
+
+Bug reports and fixes are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the ground rules (one stdlib-only file, Python 3.8+) and how to test without opening real windows. Report bugs with the [bug report form](https://github.com/mitchjablonski/cc-session-restore/issues/new?template=bug_report.yml). For security problems, see [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT
