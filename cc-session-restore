@@ -164,7 +164,9 @@ def _alive_windows(pid, started_ms=None):
     k32.CloseHandle.restype = BOOL
     h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
-        return ctypes.get_last_error() == 5  # access denied: conservatively consider it alive
+        # Access denied: conservatively alive. A pid reused by a protected
+        # system process therefore shows as running until the next boot.
+        return ctypes.get_last_error() == 5
     try:
         code = DWORD()
         if not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
@@ -610,6 +612,22 @@ def wt_title(title):
     return title or "claude"
 
 
+def ps_literal(value):
+    """A PowerShell expression for the string value, safe for any text.
+
+    PowerShell takes ' and the curly quotes U+2018-U+201B as single quotes, and
+    "..." expands $() and backticks. So anything beyond a few plain characters
+    goes in as base64 of its UTF-8 bytes, whose alphabet has no quote at all.
+    """
+    value = str(value)
+    if re.fullmatch(r"[A-Za-z0-9._=+/-]*", value):
+        return "'" + value + "'"
+    import base64
+    b64 = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return ("([System.Text.Encoding]::UTF8.GetString("
+            "[System.Convert]::FromBase64String('" + b64 + "')))")
+
+
 def ps_native_safe(arg):
     """True if PowerShell 5.1 and 7 both pass arg to a native exe unchanged."""
     return bool(arg) and '"' not in arg and not (re.search(r"\s", arg) and arg.endswith("\\"))
@@ -645,7 +663,7 @@ def windows_command(s, cd=None):
     With cd, the bootstrap changes folder itself: wt's -d expands %VARS%.
     """
     import base64
-    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    q = ps_literal
     command = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
     args = ["--resume", s["id"], *windows_args(CLAUDE_ARGS)]
     # PowerShell starts native commands (cmd) in its current location.
@@ -742,10 +760,9 @@ def launch(sessions, dry_run=False, terminal=None, log=print):
                 if not all(ps_native_safe(c) for c in argv):
                     errors.append(f"{s['title']}: can't print a command PowerShell 5.1 passes safely")
                     continue
-                q = lambda c: "'" + c.replace("'", "''") + "'"
-                prefix = ("Set-Location -LiteralPath " + q(kw["cwd"]) + "; "
+                prefix = ("Set-Location -LiteralPath " + ps_literal(kw["cwd"]) + "; "
                           if "cwd" in kw else "")
-                log(prefix + "& " + " ".join(q(c) for c in argv))
+                log(prefix + "& " + " ".join(ps_literal(c) for c in argv))
             else:
                 log(" ".join(shlex.quote(c) for c in argv))
             continue
@@ -1133,17 +1150,31 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
 
 def windows_shortcut(powershell, target, arguments, workdir, destination=None):
     """Create '<Start menu>/Claude Code sessions.lnk' via PowerShell."""
-    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    if IS_WINDOWS:
+        # WScript.Shell can't save a shortcut for text outside the ANSI code
+        # page; strict mbcs (no best-fit mapping) matches what it can store.
+        programs = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs"
+        for value in (target, arguments, workdir, destination or programs):
+            try:
+                str(value).encode("mbcs")
+            except UnicodeEncodeError:
+                die(f"can't create a Start menu shortcut for {str(value)!r}: Windows shortcuts "
+                    "only hold characters of the system code page. Install from a folder "
+                    "whose path uses only those characters.")
+    q = ps_literal
     location = (q(destination) if destination is not None else
                 "(Join-Path ([Environment]::GetFolderPath('Programs')) 'Claude Code sessions.lnk')")
     ps = ("$ErrorActionPreference='Stop';"
           f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({location});"
           f"$s.TargetPath={q(target)};$s.Arguments={q(arguments)};"
           f"$s.WorkingDirectory={q(workdir)};$s.WindowStyle=7;"
-          "$s.Description='Reopen your Claude Code sessions (cc-session-restore)';$s.Save()")
-    subprocess.run([powershell, "-NoProfile", "-Command", ps], check=True,
-                   cwd="/mnt/c" if IS_WSL and Path("/mnt/c").is_dir() else None,
-                   **({"creationflags": 0x08000000} if IS_WINDOWS else {}))  # CREATE_NO_WINDOW
+          "$s.Description=" + q("Reopen your Claude Code sessions (cc-session-restore)") + ";$s.Save()")
+    try:
+        subprocess.run([powershell, "-NoProfile", "-Command", ps], check=True,
+                       cwd="/mnt/c" if IS_WSL and Path("/mnt/c").is_dir() else None,
+                       **({"creationflags": 0x08000000} if IS_WINDOWS else {}))  # CREATE_NO_WINDOW
+    except subprocess.CalledProcessError as e:
+        die(f"PowerShell couldn't create the Start menu shortcut (exit code {e.returncode}).")
 
 
 def desktop_quote(arg):
@@ -1190,7 +1221,7 @@ def install():
                 f"{me} / {python}. Move it to a folder without one.")
         distro = os.environ["WSL_DISTRO_NAME"]
         wsl_args = f'-d {distro} --cd "{me.parent}" -- "{python}" "./{me.name}" --gui'
-        cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '{wsl_args.replace(chr(39), chr(39) * 2)}'"
+        cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList {ps_literal(wsl_args)}"
         enc = base64.b64encode(cmd.encode("utf-16-le")).decode()
         windows_shortcut("powershell.exe", "powershell.exe",
                          f"-NoProfile -WindowStyle Hidden -EncodedCommand {enc}", "C:\\")

@@ -1,5 +1,6 @@
 """Native Windows integration checks; never open a window or read real sessions."""
 import base64
+import re
 import importlib.machinery
 import importlib.util
 import json
@@ -11,6 +12,41 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+
+
+# Every character PowerShell reads as a single quote, plus $(), a backtick and ;.
+HOSTILE = "' \u2018 \u2019 \u201a \u201b $(calc) `x ;"
+# The same without U+201B, which isn't in the ANSI code page WScript.Shell needs.
+HOSTILE_ANSI = "' \u2018 \u2019 \u201a $(calc) `x ;"
+EXPR = re.compile(r"\(\[System\.Text\.Encoding\]::UTF8\.GetString\("
+                  r"\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]*)'\)\)\)")
+PLAIN = re.compile(r"'([A-Za-z0-9._=+/-]*)'")
+
+
+def ps_values(source):
+    """The string values in generated PowerShell, and the source with them cut out."""
+    values = [base64.b64decode(m).decode("utf-8") for m in EXPR.findall(source)]
+    return values, EXPR.sub("<EXPR>", source)
+
+
+def ps_args(line):
+    """Decode a printed '& a b c' line made only of ps_literal() values."""
+    tokens = re.findall(EXPR.pattern + "|" + PLAIN.pattern, line)
+    rebuilt = " ".join(("'" + p + "'") if not b else restore.ps_literal(base64.b64decode(b).decode("utf-8"))
+                            for b, p in tokens)
+    assert rebuilt == line.strip(), (rebuilt, line)  # nothing else in the line
+    args = [base64.b64decode(b).decode("utf-8") if b else p for b, p in tokens]
+    return args
+
+
+def assert_no_raw(test, source, values):
+    """No quote-like, $() or backtick outside base64, and no raw untrusted value."""
+    _, rest = ps_values(source)
+    rest = PLAIN.sub("<LIT>", rest)
+    for bad in ("'", "\u2018", "\u2019", "\u201a", "\u201b", "$(", "`"):
+        test.assertNotIn(bad, rest, source)
+    for v in values:
+        test.assertNotIn(v, source)
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "cc-session-restore"
@@ -25,7 +61,8 @@ class WindowsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ccsr-windows-")
         self.addCleanup(self.temp.cleanup)
-        self.folder = Path(self.temp.name) / "space & caret^ %CCSR_TEST_EXPAND% ! (x) ' \u00e9 \u65e5\u672c"
+        self.folder = Path(self.temp.name) / ("space & caret^ %CCSR_TEST_EXPAND% ! (x) \u00e9 \u65e5\u672c "
+                                              + HOSTILE)
         self.folder.mkdir()
         self.capture = self.folder / "capture.py"
         self.capture.write_text(
@@ -34,8 +71,8 @@ class WindowsTests(unittest.TestCase):
             encoding="utf-8")
         self.shim = self.folder / "fake claude.cmd"
         self.shim.write_text('@"' + sys.executable + '" "%~dp0capture.py" %*\r\n')
-        self.session = {"cwd": str(self.folder), "title": "fake; title & !",
-                        "id": "session & ^ %CCSR_TEST_EXPAND% ! (x) space \u00e9 \u65e5\u672c"}
+        self.session = {"cwd": str(self.folder), "title": "fake; title & ! " + HOSTILE,
+                        "id": "session & ^ %CCSR_TEST_EXPAND% ! (x) space \u00e9 \u65e5\u672c " + HOSTILE}
         self.env = mock.patch.dict(os.environ, {"CCSR_TEST_EXPAND": "SHOULD_NOT_EXPAND"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -120,7 +157,7 @@ class WindowsTests(unittest.TestCase):
         if any(p in policy.stdout for p in ("Restricted", "AllSigned")):
             self.skipTest("local policy blocks unsigned .ps1 files; policy is preserved")
         shim = self.folder / "fake claude.ps1"
-        q = lambda s: "'" + str(s).replace("'", "''") + "'"
+        q = restore.ps_literal
         # A BOM makes Windows PowerShell read the non-ASCII path as UTF-8.
         shim.write_text("& " + q(sys.executable) + " " + q(self.capture) + " @args\n",
                         encoding="utf-8-sig")
@@ -149,12 +186,12 @@ class WindowsTests(unittest.TestCase):
                 mock.patch.object(restore, "CLAUDE_ARGS", ""):
             argv, kw = restore.launch_cmd(self.session, "windows-terminal")
         self.assertEqual(argv[0], "wt.exe")
-        self.assertIn("fake\\; title & !", argv)
+        self.assertIn(restore.wt(["fake; title & ! " + HOSTILE])[0], argv)
         self.assertNotIn("-d", argv)  # wt would expand %CCSR_TEST_EXPAND% in -d
         self.assertEqual(kw, {})
         script = base64.b64decode(argv[-1]).decode("utf-16-le")
-        self.assertTrue(script.startswith("Set-Location -LiteralPath '" +
-                                          str(self.folder).replace("'", "''") + "';"))
+        self.assertTrue(script.startswith("Set-Location -LiteralPath " + restore.ps_literal(self.folder) + ";"))
+        assert_no_raw(self, script, [str(self.folder), self.session["id"]])
         self.assertIn("/d /v:off /s /k", script)
         self.assertIn(self.session["id"], script)
 
@@ -193,12 +230,12 @@ class WindowsTests(unittest.TestCase):
     def test_real_shortcut_readback_in_temporary_folder(self):
         # WScript.Shell can't save shortcuts outside the ANSI code page, so this
         # folder keeps the shell metacharacters but not the non-ASCII part.
-        folder = Path(self.temp.name) / "space & caret^ %CCSR_TEST_EXPAND% ! (x) '"
+        folder = Path(self.temp.name) / ("space & caret^ %CCSR_TEST_EXPAND% ! (x) " + HOSTILE_ANSI)
         folder.mkdir()
         shortcut = folder / "test sessions.lnk"
         arguments = subprocess.list2cmdline([str(SCRIPT), "--gui"])
         restore.windows_shortcut("powershell.exe", sys.executable, arguments, folder, shortcut)
-        q = "'" + str(shortcut).replace("'", "''") + "'"
+        q = restore.ps_literal(shortcut)
         result = self.run_hidden(["powershell.exe", "-NoProfile", "-Command",
                                   "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
                                   "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(" + q + ");"
@@ -210,6 +247,14 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(data["Arguments"], arguments)
         self.assertEqual(data["WorkingDirectory"], str(folder))
         self.assertEqual(data["WindowStyle"], 7)
+
+    def test_install_rejects_non_ansi_paths_before_powershell(self):
+        with mock.patch.object(restore.subprocess, "run") as run, \
+                self.assertRaises(SystemExit) as cm:
+            restore.windows_shortcut("powershell.exe", sys.executable, "--gui", self.folder,
+                                     self.folder / "x.lnk")
+        run.assert_not_called()
+        self.assertIn("code page", str(cm.exception))
 
     def test_install_selects_pythonw_with_console_fallback(self):
         for exists in (True, False):
@@ -294,10 +339,8 @@ class PortableStringTests(unittest.TestCase):
         self.assertEqual(errors, [])
         line = lines[0]
         self.assertTrue(line.startswith("& 'wt.exe' "))
-        # Undo PowerShell's single-quoted literals to get what it hands wt.
-        import re
-        literals = [m.replace("''", "'") for m in re.findall(r"'((?:[^']|'')*)'", line)]
-        self.assertEqual(literals, argv)
+        self.assertEqual(ps_args(line[2:]), argv)  # what PowerShell hands wt
+        assert_no_raw(self, line, [session["title"]] if len(session["title"]) > 1 else [])
         return argv
 
     def test_emulators_reproduce_the_reported_split(self):
@@ -315,6 +358,76 @@ class PortableStringTests(unittest.TestCase):
                 self.assertEqual(argv_w(ps51_join(argv[1:])), argv[1:])  # Windows PowerShell 5.1
                 self.assertEqual(argv_w(subprocess.list2cmdline(argv[1:])), argv[1:])  # PS 7.3+, Popen
                 self.assertTrue(all(restore.ps_native_safe(a) for a in argv))
+
+    def test_ps_str_round_trips_any_text(self):
+        for value in ("", "plain-1.0", HOSTILE, "C:\\a b\\", "\u00e9 \u65e5\u672c", '"$env:X"'):
+            expr = restore.ps_literal(value)
+            self.assertEqual(ps_args(expr), [value])
+            if value not in ("", "plain-1.0"):
+                assert_no_raw(self, expr, [value])
+
+    def hostile_session(self):
+        return {"cwd": "C:\\x" + HOSTILE + "\\proj", "title": "t " + HOSTILE, "id": "id" + HOSTILE}
+
+    def test_bootstrap_has_no_raw_untrusted_text(self):
+        s = self.hostile_session()
+        for claude in ("claude", "C:\\npm\\claude.ps1"):
+            with self.subTest(claude=claude), mock.patch.object(restore, "CLAUDE_BIN", claude), \
+                    mock.patch.object(restore, "CLAUDE_ARGS", ""), \
+                    mock.patch.object(restore.shutil, "which", return_value=None):
+                argv, _ = restore.launch_cmd(s, "windows-terminal")
+            script = base64.b64decode(argv[-1]).decode("utf-16-le")
+            assert_no_raw(self, script, [s["cwd"], s["id"]])
+            values, _ = ps_values(script)
+            self.assertIn(s["cwd"], values)
+            self.assertIn(s["id"], values)
+
+    def test_dry_run_lines_have_no_raw_untrusted_text(self):
+        s = self.hostile_session()
+        for terminal in ("windows-terminal", "windows-console"):
+            lines = []
+            with self.subTest(terminal=terminal), mock.patch.object(restore, "IS_WINDOWS", True), \
+                    mock.patch.object(restore, "CLAUDE_BIN", "claude"), \
+                    mock.patch.object(restore, "CLAUDE_ARGS", ""), \
+                    mock.patch.object(restore.shutil, "which", return_value=None), \
+                    mock.patch.object(restore.subprocess, "Popen") as popen:
+                self.assertEqual(restore.launch([s], dry_run=True, terminal=terminal,
+                                                log=lines.append), [])
+                popen.assert_not_called()
+            assert_no_raw(self, lines[0], [s["cwd"], s["title"], restore.wt_title(s["title"])])
+            values, _ = ps_values(lines[0])
+            if terminal == "windows-console":
+                self.assertEqual(values[0], s["cwd"])  # Set-Location
+            else:
+                self.assertIn(restore.wt([restore.wt_title(s["title"])])[0], values)
+
+    def test_shortcut_writer_has_no_raw_untrusted_text(self):
+        folder = "C:\\x" + HOSTILE
+        with mock.patch.object(restore, "IS_WINDOWS", False), \
+                mock.patch.object(restore.subprocess, "run") as run:
+            restore.windows_shortcut("powershell.exe", folder + "\\python.exe", '"a" ' + HOSTILE,
+                                     folder, folder + "\\x.lnk")
+        ps = run.call_args[0][0][3]
+        assert_no_raw(self, ps, [folder])
+        values, _ = ps_values(ps)
+        self.assertEqual(values[:4], [folder + "\\x.lnk", folder + "\\python.exe", '"a" ' + HOSTILE, folder])
+
+    def test_wsl_install_encodes_the_clone_path(self):
+        me = "/home/me/x" + HOSTILE + "/cc-session-restore"
+        with mock.patch.object(restore, "IS_WSL", True), \
+                mock.patch.object(restore, "__file__", me), \
+                mock.patch.object(restore, "ephemeral_install", return_value=False), \
+                mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}), \
+                mock.patch.object(restore, "windows_shortcut") as shortcut, \
+                mock.patch("builtins.print"):
+            restore.install()
+        arguments = shortcut.call_args[0][2]
+        script = base64.b64decode(arguments.split("-EncodedCommand ")[1]).decode("utf-16-le")
+        self.assertTrue(script.startswith("Start-Process wsl.exe -WindowStyle Hidden -ArgumentList "))
+        assert_no_raw(self, script, [me, str(Path(me).parent)])
+        values, _ = ps_values(script)
+        self.assertEqual(values, ['-d Ubuntu --cd "%s" -- "%s" "./cc-session-restore" --gui'
+                                  % (Path(me).parent, sys.executable or "python3")])
 
     def test_native_safety_check(self):
         for bad in ("", 'a"b', "C:\\a b\\"):
