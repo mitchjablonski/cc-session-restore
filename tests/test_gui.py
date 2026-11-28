@@ -36,6 +36,9 @@ class GuiTests(unittest.TestCase):
                                                   side_effect=AssertionError("browser opened")))
         self.stack.enter_context(mock.patch.object(self.app.subprocess, "Popen",
                                                   side_effect=AssertionError("process launched")))
+        # HTTPServer resolves its display name during bind. Avoid external DNS
+        # delays on CI; requests still traverse the real loopback socket.
+        self.stack.enter_context(mock.patch("socket.getfqdn", return_value="localhost"))
         self.stack.enter_context(mock.patch.object(self.app, "recent_sessions", return_value=[
             {"id": "fake-session", "running": False}]))
         self.stack.enter_context(mock.patch.object(self.app, "sessions_payload", return_value={"sessions": []}))
