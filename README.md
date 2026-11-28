@@ -50,6 +50,7 @@ The page is served on `127.0.0.1` only. Its link works once and is swapped for a
 ```bash
 cc-session-restore              # interactive picker
 cc-session-restore list         # just print the list
+cc-session-restore doctor       # show diagnostics for a bug report
 cc-session-restore -y           # reopen all pre-checked sessions, no questions
 cc-session-restore -n 30        # show more sessions
 cc-session-restore --dry-run    # print the commands instead of running them
@@ -93,7 +94,7 @@ Only sessions you started yourself in a terminal are listed. SDK and background 
 
 ## Caveats
 
-- **This depends on Claude Code's internal files.** The session registry and transcript layout aren't a public API and may change in any release. If the list comes up empty or wrong after a Claude Code update, please open an issue.
+- **This depends on Claude Code's internal files.** The session registry and transcript layout aren't a public API and may change in any release. If the list comes up empty or wrong, include the output of `cc-session-restore doctor` in your bug report. It reports the environment, registry field changes and why transcripts were skipped. The default output hides paths, session titles and IDs. Use `doctor --verbose` locally to see paths, titles and unknown field names, and review those details before sharing them.
 - **Pre-checking is a best guess.** It relies on Claude Code cleaning up its own files. Uncheck anything you don't want.
 - **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested. The macOS, native Windows and other Linux terminal launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
 

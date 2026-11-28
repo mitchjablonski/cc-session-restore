@@ -7,6 +7,8 @@ Unofficial; not affiliated with Anthropic. Works on macOS, Linux, Windows and WS
   cc-session-restore --gui        the same, as a page in your browser
                                   (--no-browser just prints the URL; --port N picks the port)
   cc-session-restore list         just print the list
+  cc-session-restore doctor       print a diagnostic report for bug reports
+                                  (--verbose includes private paths, titles and field names)
   cc-session-restore -y           reopen the pre-checked sessions without asking
   cc-session-restore -n 30        show 30 sessions instead of 15
   cc-session-restore --dry-run    print the launch commands instead of running them
@@ -36,6 +38,7 @@ How it knows what you had open:
 """
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -43,7 +46,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
+
+__version__ = "0.1.1"
 
 CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 PROJECTS = CLAUDE / "projects"
@@ -58,6 +64,11 @@ MAX_AGE_DAYS = 14           # ...and only if last seen within this long before b
 CLAUDE_ARGS = os.environ.get("CC_SESSION_RESTORE_CLAUDE_ARGS", "")
 CLAUDE_BIN = os.environ.get("CC_SESSION_RESTORE_CLAUDE_BIN", "claude")
 WINDOW_NAME = "claude"      # Windows Terminal window that sessions open in
+LINUX_TERMINALS = ("gnome-terminal", "konsole", "xfce4-terminal", "kitty", "wezterm",
+                   "alacritty", "x-terminal-emulator", "xterm")
+SUPPORTED_TERMINALS = frozenset(LINUX_TERMINALS) | {
+    "wsl", "windows-terminal", "windows-console", "tmux", "iterm", "macos-terminal",
+}
 
 IS_WINDOWS = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -88,28 +99,35 @@ def clean_title(t):
 _boot = []
 
 
-def boot_time():
-    """Unix time of the last boot (the WSL VM's, inside WSL), or None."""
+def boot_info():
+    """Unix time of the last boot (or None) and the platform source queried."""
     if not _boot:
         bt = None
         try:
             if IS_WINDOWS:
+                source = "Windows GetTickCount64"
                 import ctypes
                 ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
                 bt = time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
             elif IS_MAC:
+                source = "sysctl kern.boottime"
                 out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
                                      text=True, timeout=5).stdout
                 m = re.search(r"sec = (\d+)", out)
                 bt = int(m.group(1)) if m else None
             else:
+                source = "procfs btime"
                 for line in Path("/proc/stat").read_text().splitlines():
                     if line.startswith("btime "):
                         bt = int(line.split()[1])
         except Exception:
             bt = None
-        _boot.append(bt)
+        _boot.append((bt, source))
     return _boot[0]
+
+
+def boot_time():
+    return boot_info()[0]
 
 
 def _alive_windows(pid):
@@ -156,6 +174,13 @@ def is_alive(d):
 
 # ---------------------------------------------------------------- discovery
 
+# Core fields used to identify a process and decide whether its session can be restored.
+EXPECTED_REGISTRY_FIELDS = {"sessionId", "pid", "startedAt", "entrypoint", "kind"}
+KNOWN_REGISTRY_FIELDS = EXPECTED_REGISTRY_FIELDS | {
+    "procStart", "updatedAt", "statusUpdatedAt", "name", "nameSource",
+}
+
+
 def _load_json(f):
     for attempt in range(2):  # Claude may be rewriting the file right now
         try:
@@ -167,31 +192,77 @@ def _load_json(f):
     return None
 
 
-def read_registry():
+def directory_entries(path, report, label=None):
+    """Record directory listing failures that a glob would silently skip."""
+    try:
+        entries = list(path.iterdir())
+        status = "found"
+    except (FileNotFoundError, NotADirectoryError):
+        status, entries = "not found", []
+    except OSError as error:
+        status, entries = "unreadable", []
+        report.errors.append((path, error))
+    if label:
+        report.directories[label] = status
+    elif status == "unreadable":
+        report.unreadable_project_folders += 1
+    return entries
+
+
+def discovery_files(root, pattern, report, label, nested=False):
+    if report is None:
+        # Keep the picker's established glob behavior, including dangling links.
+        yield from root.glob("*/" + pattern if nested else pattern)
+        return
+    entries = directory_entries(root, report, label)
+    if nested:
+        entries = (path for child in entries for path in directory_entries(child, report))
+    yield from (path for path in entries if path.match(pattern))
+
+
+def read_registry(report=None):
     """-> running ids, {dead id: last seen}, {id: user-given name}, {id: derived name}"""
     running, dead, user_names, other_names, newest = set(), {}, {}, {}, {}
-    for f in REGISTRY.glob("*.json"):
+    for f in discovery_files(REGISTRY, "*.json", report, "Registry"):
         d = _load_json(f)
-        if not d:
+        if d is None:
+            if report:
+                report.registry["unparseable"] += 1
             continue
         sid = d.get("sessionId")
-        if not isinstance(sid, str) or not SESSION_ID.match(sid):
+        valid_id = isinstance(sid, str) and SESSION_ID.fullmatch(sid)
+        if not valid_id and not report:
+            continue
+        alive = is_alive(d)
+        if report:
+            report.registry["parsed"] += 1
+            report.registry["running" if alive else "dead"] += 1
+            report.missing.update(EXPECTED_REGISTRY_FIELDS - d.keys())
+            report.unknown.update(d.keys() - KNOWN_REGISTRY_FIELDS)
+        if not valid_id:
+            report.registry["invalid IDs"] += 1
+            if not alive:
+                report.registry["dead invalid"] += 1
             continue
         try:
             mtime = f.stat().st_mtime
         except OSError:
             mtime = 0
         seen = max(num(d.get("updatedAt")) / 1000, num(d.get("statusUpdatedAt")) / 1000, mtime)
-        if is_alive(d):
+        if alive:
             running.add(sid)
         elif d.get("entrypoint") == "cli" and d.get("kind") == "interactive":
             dead[sid] = max(dead.get(sid, 0), seen)
+        elif report:
+            report.registry["dead non-interactive"] += 1
         name = clean_title(d.get("name"))
         if name and seen >= newest.get(sid, -1):
             newest[sid] = seen
             (user_names if d.get("nameSource") == "user" else other_names)[sid] = name
     for sid in running:
         dead.pop(sid, None)
+    if report:
+        report.registry["dead session IDs"] = len(dead)
     return running, dead, user_names, other_names
 
 
@@ -234,7 +305,8 @@ def read_transcript(path):
                 fh.seek(max(head, size - TAIL_BYTES))
                 _scan(fh.read(), info)
     except OSError:
-        pass
+        if not info.get("cwd"):
+            info["unreadable"] = True
     return info
 
 
@@ -243,27 +315,33 @@ def in_temp_dir(cwd):
     return any(c == t or c.startswith((t + "/", t + os.sep)) for t in TEMP_DIRS)
 
 
-def recent_sessions():
-    running, dead, user_names, other_names = read_registry()
+def recent_sessions(report=None):
+    running, dead, user_names, other_names = read_registry(report)
     files = []
-    for p in PROJECTS.glob("*/*.jsonl"):
+    for p in discovery_files(PROJECTS, "*.jsonl", report, "Projects", nested=True):
         try:
             files.append((p.stat().st_mtime, p))
         except OSError:
-            pass
+            if report:
+                report.skip(p, "unreadable")
     files.sort(reverse=True)
+    if report:
+        report.over_limit = max(0, len(files) - SCAN_LIMIT)
 
     sessions = []
     for mtime, p in files[:SCAN_LIMIT]:
         sid = p.stem
-        if not SESSION_ID.match(sid):
+        if not SESSION_ID.fullmatch(sid):
+            if report:
+                report.skip(p, "invalid session ID")
             continue
         info = read_transcript(p)
         cwd = info.get("cwd")
         # Only sessions you ran yourself in a terminal, in folders that still exist.
-        if info.get("entrypoint") != "cli" or not cwd or in_temp_dir(cwd):
-            continue
-        if not Path(cwd).is_dir():
+        reason = transcript_skip_reason(info)
+        if reason:
+            if report:
+                report.skip(p, reason, cwd)
             continue
         title = (user_names.get(sid) or info.get("title") or info.get("aiTitle")
                  or other_names.get(sid) or clean_title(Path(cwd).name) or sid[:8])
@@ -275,6 +353,101 @@ def recent_sessions():
                          "was_open": was_open, "seen": max(last_seen or 0, mtime),
                          "running": sid in running})
     return sessions
+
+
+def transcript_skip_reason(info):
+    cwd = info.get("cwd")
+    if info.get("unreadable"):
+        return "unreadable"
+    if not cwd:
+        return "no cwd"
+    if info.get("entrypoint") != "cli":
+        return "SDK/background"
+    if in_temp_dir(cwd):
+        return "temporary folder"
+    try:
+        if not Path(cwd).is_dir():
+            return "missing folder"
+    except (OSError, ValueError):
+        return "unreadable"
+    return None
+
+
+class DoctorReport:
+    def __init__(self, verbose):
+        self.directories = {}
+        self.unreadable_project_folders = 0
+        self.errors = []
+        self.registry = Counter()
+        self.missing = Counter()
+        self.unknown = Counter()
+        self.skipped = Counter()
+        self.over_limit = 0
+        self.skipped_paths = [] if verbose else None
+
+    def skip(self, path, reason, cwd=None):
+        self.skipped[reason] += 1
+        if self.skipped_paths is not None:
+            self.skipped_paths.append((reason, path, cwd))
+
+
+def diagnostic_text(value):
+    """Keep private details on one line, even for unusual filenames or field names."""
+    return "".join(c if c.isprintable() else "?" for c in str(value))
+
+
+def doctor(verbose=False):
+    report = DoctorReport(verbose)
+    bt, source = boot_info()
+    boot = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(bt)) if bt is not None else "unknown"
+    terminal = detect_terminal(required=False)
+    # The override is arbitrary user input and could itself contain a private path.
+    if os.environ.get("CC_SESSION_RESTORE_TERMINAL") and terminal not in SUPPORTED_TERMINALS:
+        terminal = diagnostic_text(terminal) if verbose else "unrecognized override"
+    print(f"cc-session-restore version: {__version__}")
+    print(f"OS: {platform.system()}{' (WSL)' if IS_WSL else ''}")
+    print(f"Python: {platform.python_version()}")
+    print(f"Terminal: {terminal or 'none detected'}")
+    config_source = "CLAUDE_CONFIG_DIR" if os.environ.get("CLAUDE_CONFIG_DIR") else "default"
+    directory_entries(CLAUDE, report, "Config")
+    print(f"Config directory: {report.directories['Config']} ({config_source})")
+    print(f"Boot time: {boot} ({source})")
+    sessions = recent_sessions(report)
+    for label in ("Registry", "Projects"):
+        print(f"{label} directory: {report.directories[label]}")
+    print(f"Unreadable project folders: {report.unreadable_project_folders}")
+    registry = report.registry
+    print(f"Registry files: {registry['parsed']} parsed, {registry['unparseable']} unparseable, "
+          f"{registry['running']} running, {registry['dead']} dead")
+    print(f"Invalid registry session IDs: {registry['invalid IDs']}")
+    print(f"Dead CLI/interactive session IDs: {registry['dead session IDs']}")
+    redundant = (registry["dead"] - registry["dead invalid"] - registry["dead non-interactive"]
+                 - registry["dead session IDs"])
+    print(f"  Dead files excluded: {registry['dead invalid']} invalid ID, "
+          f"{registry['dead non-interactive']} non-interactive or non-CLI, "
+          f"{redundant} duplicate or also running")
+    print("Missing registry fields (files):" + ("" if report.missing else " none"))
+    for key, count in sorted(report.missing.items()):
+        print(f"  {key}: {count}")
+    print(f"Unknown registry fields: {len(report.unknown)} distinct")
+    skipped = sum(report.skipped.values())
+    print(f"Transcripts: {len(sessions) + skipped} scanned, {len(sessions)} included, {skipped} skipped")
+    for reason in ("no cwd", "SDK/background", "missing folder", "unreadable", "temporary folder",
+                   "invalid session ID"):
+        print(f"  {reason}: {report.skipped[reason]}")
+    if report.over_limit:
+        print(f"Outside scan limit: {report.over_limit}")
+    if verbose:
+        print(f"Config path: {diagnostic_text(CLAUDE)}")
+        for path, error in report.errors:
+            print(f"Unreadable: {diagnostic_text(path)} | {diagnostic_text(error)}")
+        for key, count in sorted(report.unknown.items()):
+            print(f"Unknown registry field: {diagnostic_text(key)} ({count} files)")
+        for s in sessions:
+            print(f"Included: {diagnostic_text(s['title'])} | {diagnostic_text(s['cwd'])}")
+        for reason, path, cwd in report.skipped_paths:
+            folder = f" | {diagnostic_text(cwd)}" if cwd else ""
+            print(f"Skipped ({reason}): {diagnostic_text(path)}{folder}")
 
 
 def precheck(sessions):
@@ -320,7 +493,7 @@ def pretty_path(cwd):
 
 # ---------------------------------------------------------------- launching
 
-def detect_terminal():
+def detect_terminal(required=True):
     t = os.environ.get("CC_SESSION_RESTORE_TERMINAL")
     if t:
         return t
@@ -345,11 +518,12 @@ def detect_terminal():
         return "konsole"
     if os.environ.get("GNOME_TERMINAL_SCREEN") or os.environ.get("GNOME_TERMINAL_SERVICE"):
         return "gnome-terminal"
-    for t in ("gnome-terminal", "konsole", "xfce4-terminal", "kitty", "wezterm",
-              "alacritty", "x-terminal-emulator", "xterm"):
+    for t in LINUX_TERMINALS:
         if shutil.which(t):
             return t
-    die("couldn't find a terminal to open sessions in. Set CC_SESSION_RESTORE_TERMINAL.")
+    if required:
+        die("couldn't find a terminal to open sessions in. Set CC_SESSION_RESTORE_TERMINAL.")
+    return None
 
 
 def login_shell():
@@ -846,9 +1020,24 @@ def install():
 FAILED = []
 
 
+def is_doctor_command(argv):
+    args = iter(argv)
+    for arg in args:
+        if arg == "--open":  # All remaining arguments are session IDs (including "doctor").
+            return False
+        if arg in ("-n", "--port", "--terminal"):
+            next(args, None)
+        elif not arg.startswith("-"):
+            return arg == "doctor"
+    return False
+
+
 def main(argv):
     if "-h" in argv or "--help" in argv:
         print(__doc__)
+        return False
+    if is_doctor_command(argv):
+        doctor(verbose="--verbose" in argv)
         return False
     if "--install" in argv:
         install()
