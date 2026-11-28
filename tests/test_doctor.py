@@ -53,13 +53,13 @@ class DoctorTests(unittest.TestCase):
         path.write_text(json.dumps(data) + "\n", encoding="utf-8")
         return path
 
-    def doctor(self, verbose=False):
+    def doctor(self, verbose=False, argv=None):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), \
                 mock.patch.object(self.module, "is_alive", side_effect=lambda d: d.get("pid") == 111), \
                 mock.patch.object(self.module, "launch", side_effect=AssertionError("doctor launched sessions")), \
                 mock.patch.object(self.module, "pick", side_effect=AssertionError("doctor opened picker")):
-            self.module.main(["doctor"] + (["--verbose"] if verbose else []))
+            self.module.main(argv if argv is not None else ["doctor"] + (["--verbose"] if verbose else []))
         return output.getvalue()
 
     def test_empty_config_reports_environment_and_zero_counts(self):
@@ -163,6 +163,105 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Config directory: not found", result.stdout)
         self.assertNotIn(str(missing), result.stdout + result.stderr)
+
+    def test_registry_and_projects_directory_presence(self):
+        output = self.doctor()
+        self.assertIn("Registry directory: not found", output)
+        self.assertIn("Projects directory: not found", output)
+        (self.config / "sessions").mkdir()
+        (self.config / "projects").mkdir()
+        output = self.doctor()
+        self.assertIn("Registry directory: found", output)
+        self.assertIn("Projects directory: found", output)
+        self.assertIn("Unreadable project folders: 0", output)
+
+    def test_unlistable_directories_report_unreadable_without_private_errors(self):
+        registry = self.config / "sessions"
+        projects = self.config / "projects"
+        registry.mkdir()
+        projects.mkdir()
+        real_iterdir = Path.iterdir
+        secret = "private-discovery-error-detail"
+        for target, label in ((self.config, "Config"), (registry, "Registry"), (projects, "Projects")):
+            with self.subTest(directory=label):
+                def denied(path):
+                    if path == target:
+                        raise PermissionError(secret + " " + str(path))
+                    return real_iterdir(path)
+
+                with mock.patch.object(Path, "iterdir", denied):
+                    output = self.doctor()
+                    verbose = self.doctor(verbose=True)
+                self.assertIn(label + " directory: unreadable", output)
+                self.assertNotIn(secret, output)
+                self.assertNotIn(str(target), output)
+                self.assertIn(str(target), verbose)
+                self.assertIn(secret, verbose)
+
+    def test_unlistable_project_folder_is_counted_and_other_folders_are_scanned(self):
+        self.transcript("private-readable-id", {"cwd": str(self.cwd), "entrypoint": "cli"})
+        unreadable = self.config / "projects" / "private-unlistable-project"
+        unreadable.mkdir()
+        real_iterdir = Path.iterdir
+        secret = "private-project-list-error"
+
+        def denied(path):
+            if path == unreadable:
+                raise OSError(secret + " " + str(path))
+            return real_iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", denied):
+            output = self.doctor()
+            verbose = self.doctor(verbose=True)
+        self.assertIn("Projects directory: found", output)
+        self.assertIn("Unreadable project folders: 1", output)
+        self.assertIn("Transcripts: 1 scanned, 1 included, 0 skipped", output)
+        self.assertNotIn(str(unreadable), output)
+        self.assertNotIn(secret, output)
+        self.assertIn(str(unreadable), verbose)
+        self.assertIn(secret, verbose)
+
+    def test_registry_id_counts_are_validated_distinct_and_exclude_running_ids(self):
+        base = {"pid": 222, "entrypoint": "cli", "kind": "interactive"}
+        for name, sid in (("missing", None), ("number", 123), ("empty", ""),
+                          ("bad", "private/invalid-id")):
+            data = dict(base)
+            if sid is not None:
+                data["sessionId"] = sid
+            self.registry(name, data)
+        self.registry("dead-one", dict(base, sessionId="private-dead-id"))
+        self.registry("dead-duplicate", dict(base, sessionId="private-dead-id"))
+        self.registry("stale-running", dict(base, sessionId="private-running-id"))
+        self.registry("running", dict(base, sessionId="private-running-id", pid=111))
+        self.registry("sdk", dict(base, sessionId="private-sdk-id", entrypoint="sdk"))
+        self.registry("background", dict(base, sessionId="private-background-id", kind="background"))
+        output = self.doctor()
+        self.assertIn("Invalid registry session IDs: 4", output)
+        self.assertIn("Dead CLI/interactive session IDs: 1", output)
+        self.assertIn("Dead files excluded: 4 invalid ID, 2 non-interactive or non-CLI, "
+                      "2 duplicate or also running", output)
+        self.assertNotIn("private-dead-id", output)
+        self.assertNotIn("private-running-id", output)
+
+    def test_doctor_command_after_safe_options_stays_diagnostic(self):
+        for argv in (["--verbose", "doctor"], ["-y", "doctor"]):
+            with self.subTest(argv=argv):
+                output = self.doctor(argv=argv)
+                self.assertIn("Registry files:", output)
+                self.assertIn("Transcripts:", output)
+                if "--verbose" in argv:
+                    self.assertIn(str(self.config), output)
+
+    def test_open_doctor_is_a_session_selector_not_a_diagnostic_command(self):
+        session = {"id": "doctor", "running": False}
+        output = io.StringIO()
+        with mock.patch.object(self.module, "recent_sessions", return_value=[session]), \
+                mock.patch.object(self.module, "launch", return_value=[]) as launch, \
+                mock.patch.object(self.module, "doctor", side_effect=AssertionError("wrong command")), \
+                contextlib.redirect_stdout(output):
+            self.module.main(["--open", "doctor"])
+        launch.assert_called_once_with([session], False, None)
+        self.assertNotIn("Registry files:", output.getvalue())
 
 
 if __name__ == "__main__":
