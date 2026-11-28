@@ -107,8 +107,9 @@ def boot_info():
             if IS_WINDOWS:
                 source = "Windows GetTickCount64"
                 import ctypes
-                ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
-                bt = time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
+                k32 = _win_dll("kernel32")
+                k32.GetTickCount64.restype = ctypes.c_ulonglong
+                bt = time.time() - k32.GetTickCount64() / 1000
             elif IS_MAC:
                 source = "sysctl kern.boottime"
                 out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
@@ -130,25 +131,52 @@ def boot_time():
     return boot_info()[0]
 
 
-def _alive_windows(pid):
+def _win_dll(name):
+    """A Windows DLL whose GetLastError value ctypes.get_last_error() reads reliably."""
     import ctypes
-    from ctypes import wintypes
+    return ctypes.WinDLL(name, use_last_error=True)
+
+
+# A process created this long after the session's startedAt is a different
+# process that reused the pid. Creation precedes startedAt, so only the late
+# side needs a bound; the slack absorbs clock adjustments.
+PID_REUSE_SLACK_MS = 10_000
+
+
+def _alive_windows(pid, started_ms=None):
+    import ctypes
     if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid <= 0xffffffff:
         return False
-    k32 = ctypes.windll.kernel32
-    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    k32.OpenProcess.restype = wintypes.HANDLE
-    k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-    k32.GetExitCodeProcess.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    k32.CloseHandle.restype = wintypes.BOOL
+    # Plain ctypes types (not wintypes) keep this importable for mocked tests.
+    HANDLE, DWORD, BOOL = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("low", DWORD), ("high", DWORD)]
+
+    k32 = _win_dll("kernel32")
+    k32.OpenProcess.argtypes = (DWORD, BOOL, DWORD)
+    k32.OpenProcess.restype = HANDLE
+    k32.GetExitCodeProcess.argtypes = (HANDLE, ctypes.POINTER(DWORD))
+    k32.GetExitCodeProcess.restype = BOOL
+    k32.GetProcessTimes.argtypes = (HANDLE,) + (ctypes.POINTER(FILETIME),) * 4
+    k32.GetProcessTimes.restype = BOOL
+    k32.CloseHandle.argtypes = (HANDLE,)
+    k32.CloseHandle.restype = BOOL
     h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
-        return k32.GetLastError() == 5  # access denied: conservatively consider it alive
+        return ctypes.get_last_error() == 5  # access denied: conservatively consider it alive
     try:
-        code = wintypes.DWORD()
-        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
-        return bool(ok) and code.value == 259  # STILL_ACTIVE
+        code = DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+            return False
+        if not started_ms:
+            return True
+        times = [FILETIME() for _ in range(4)]  # creation, exit, kernel, user
+        if not k32.GetProcessTimes(h, *(ctypes.byref(t) for t in times)):
+            return True  # can't tell; keep the old answer
+        created = (times[0].high << 32) | times[0].low  # 100 ns ticks since 1601
+        created_ms = (created - 116444736000000000) // 10000
+        return created_ms <= started_ms + PID_REUSE_SLACK_MS
     finally:
         k32.CloseHandle(h)
 
@@ -163,7 +191,7 @@ def is_alive(d):
     if started and bt and started < bt - 60:
         return False
     if IS_WINDOWS:
-        return _alive_windows(pid)
+        return _alive_windows(pid, num(d.get("startedAt")))  # same pid, newer process -> dead
     stat = Path(f"/proc/{pid}/stat")
     if stat.exists() or sys.platform.startswith("linux"):
         try:
@@ -570,13 +598,30 @@ def wt(args):
     return [a.replace(";", "\\;") for a in args]
 
 
+def wt_title(title):
+    """A tab title that is always one plain wt argument, however it is passed.
+
+    Windows PowerShell 5.1 does not escape '"' (or a backslash before the
+    closing quote it adds) in native arguments, so a pasted --dry-run line
+    could split such a title into extra wt arguments. wt would also read a
+    leading '-' as an option.
+    """
+    title = re.sub(r"^[\s-]+|[\s\\]+$", "", title.replace('"', "'"))
+    return title or "claude"
+
+
+def ps_native_safe(arg):
+    """True if PowerShell 5.1 and 7 both pass arg to a native exe unchanged."""
+    return bool(arg) and '"' not in arg and not (re.search(r"\s", arg) and arg.endswith("\\"))
+
+
 def windows_args(text):
     """Parse extra flags using Windows argv rules, including quotes within flags."""
     if not text.strip():
         return []
     import ctypes
     from ctypes import wintypes
-    shell32, k32 = ctypes.windll.shell32, ctypes.windll.kernel32
+    shell32, k32 = _win_dll("shell32"), _win_dll("kernel32")
     shell32.CommandLineToArgvW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
     shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
     k32.LocalFree.argtypes = (wintypes.HLOCAL,)
@@ -584,24 +629,27 @@ def windows_args(text):
     count = ctypes.c_int()
     argv = shell32.CommandLineToArgvW("claude " + text, ctypes.byref(count))
     if not argv:
-        raise ctypes.WinError()
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
         return list(argv[:count.value])[1:]
     finally:
         k32.LocalFree(argv)
 
 
-def windows_command(s):
+def windows_command(s, cd=None):
     """An encoded bootstrap avoids interpreting session data as shell syntax.
 
     Set cmd's arguments inside the new terminal (not wt's possibly existing
     server). Percent expansion happens once, with delayed expansion disabled.
     PowerShell scripts run directly; npm's .cmd shim still runs under cmd /k.
+    With cd, the bootstrap changes folder itself: wt's -d expands %VARS%.
     """
     import base64
     q = lambda v: "'" + str(v).replace("'", "''") + "'"
     command = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
     args = ["--resume", s["id"], *windows_args(CLAUDE_ARGS)]
+    # PowerShell starts native commands (cmd) in its current location.
+    prefix = "Set-Location -LiteralPath " + q(cd) + ";" if cd else ""
     if command.lower().endswith(".ps1"):
         script = "& " + q(command) + " " + " ".join(q(a) for a in args)
     else:
@@ -616,7 +664,7 @@ def windows_command(s):
         inner = '"' + " ".join(('"%%CCSR_ARG%d%%"' % i) if a else '""'
                                for i, a in enumerate(values)) + '"'
         script += ";& $env:ComSpec /d /v:off /s /k " + q(inner)
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    encoded = base64.b64encode((prefix + script).encode("utf-16-le")).decode("ascii")
     return ["powershell.exe", "-NoLogo", "-NoProfile",
             *(["-NoExit"] if command.lower().endswith(".ps1") else []),
             "-EncodedCommand", encoded]
@@ -629,11 +677,12 @@ def launch_cmd(s, terminal):
     if terminal == "wsl":
         distro = os.environ.get("WSL_DISTRO_NAME") or die("--terminal wsl only works inside WSL")
         # -e runs the shell directly, so `inner` is interpreted once, by your shell.
-        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", title, "wsl.exe",
+        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", wt_title(title), "wsl.exe",
                                "-d", distro, "--cd", cwd, "-e", *login_shell(), inner])], {}
     if terminal == "windows-terminal":
-        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", title, "-d", cwd,
-                               *windows_command(s)])], {}
+        # No -d: wt expands %VARS% in it. Values stay out of wt's own syntax.
+        return ["wt.exe", *wt(["-w", WINDOW_NAME, "new-tab", "--title", wt_title(title),
+                               *windows_command(s, cd=cwd)])], {}
     if terminal == "windows-console":
         # No std handle redirection, or the new console gets no keyboard/screen.
         return windows_command(s), {"cwd": cwd, "creationflags": 0x10, "console": True}  # CREATE_NEW_CONSOLE
@@ -690,6 +739,9 @@ def launch(sessions, dry_run=False, terminal=None, log=print):
             # Native Windows output is a PowerShell command, including paths
             # with spaces/apostrophes. Other platforms use POSIX shell syntax.
             if IS_WINDOWS:
+                if not all(ps_native_safe(c) for c in argv):
+                    errors.append(f"{s['title']}: can't print a command PowerShell 5.1 passes safely")
+                    continue
                 q = lambda c: "'" + c.replace("'", "''") + "'"
                 prefix = ("Set-Location -LiteralPath " + q(kw["cwd"]) + "; "
                           if "cwd" in kw else "")
