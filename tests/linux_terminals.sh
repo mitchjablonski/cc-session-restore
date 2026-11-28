@@ -25,6 +25,7 @@ mkdir -p "$out" "$bin" "$work/config/projects/p" "$proj"
 cat > "$bin/claude" <<EOF
 #!/bin/sh
 { pwd -P; for a in "\$@"; do printf '%s\n' "\$a"; done; } > "$out/\$2.tmp"
+env | grep -E '^(GNOME_TERMINAL_SCREEN|KONSOLE_DBUS_(WINDOW|SESSION)|WEZTERM_PANE|KITTY_WINDOW_ID|WINDOWID)=' > "$out/\$2.env" || true
 mv "$out/\$2.tmp" "$out/\$2.txt"
 sleep 20
 EOF
@@ -87,13 +88,18 @@ check s1 "-dash title one"
 
 # Second session while the first is still open: tab-capable terminals add a tab
 # to the running instance (wezterm: `cli spawn`, as when run from inside wezterm).
-if [ "$term" = wezterm ]; then
-    export WEZTERM_PANE=0
-fi
+# gnome-terminal opens --tab next to the terminal in GNOME_TERMINAL_SCREEN, which
+# is set when you run cc-session-restore from inside gnome-terminal.
+case $term in
+    wezterm) export WEZTERM_PANE=0 ;;
+    gnome-terminal) export "$(grep ^GNOME_TERMINAL_SCREEN= "$out/s1.env")" ;;
+esac
 echo "+ $("$repo/cc-session-restore" --dry-run --terminal "$term" --open s2)"
 "$repo/cc-session-restore" --terminal "$term" --open s2
 check s2 "title two"
 
+echo "terminal environment of s1 and s2:"
+cat "$out/s1.env" "$out/s2.env"
 if [ -n "${WM_CLASS:-}" ]; then
     sleep 1
     n=$(xdotool search --onlyvisible --class "$WM_CLASS" | wc -l)
