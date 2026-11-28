@@ -15,13 +15,29 @@ Works on **macOS**, **Linux**, **Windows**, and **WSL** (Claude Code in WSL, ope
 
 ## Install
 
+With [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), straight from GitHub (macOS, Linux, WSL):
+
+```bash
+pipx install git+https://github.com/mitchjablonski/cc-session-restore
+# or
+uv tool install git+https://github.com/mitchjablonski/cc-session-restore
+
+cc-session-restore --install
+```
+
+This puts `cc-session-restore` on your PATH. Update with `pipx upgrade cc-session-restore` or `uv tool upgrade cc-session-restore`.
+
+**Native Windows:** pipx and uv installs don't run there. The command they add has no `.exe` wrapper, so Windows can't start it. Use the clone below instead.
+
+Or clone it and run the file directly. This works everywhere, including native Windows:
+
 ```bash
 git clone https://github.com/mitchjablonski/cc-session-restore
 cd cc-session-restore
 ./cc-session-restore --install      # Windows: python cc-session-restore --install
 ```
 
-Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher:
+Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher. The launcher runs the script with the exact Python that ran `--install` (for pipx or uv, the tool's own environment), so it keeps working until you uninstall or move the tool or that Python. If you do, run `--install` again. It refuses to run from a one-off `uvx` or `pipx run`, whose environments get cleaned up. Where the launcher goes:
 
 | Where Claude Code runs | Launcher |
 |---|---|
@@ -32,7 +48,7 @@ Run it with the same Python, on the same side (Windows or WSL), as your Claude C
 
 To have the picker open automatically when you log in, copy that launcher into your startup items. On Windows, that's the `shell:startup` folder.
 
-It's also handy on your PATH: `ln -s "$PWD/cc-session-restore" ~/.local/bin/`
+If you cloned it, it's also handy on your PATH: `ln -s "$PWD/cc-session-restore" ~/.local/bin/`
 
 ## Use
 

@@ -1,0 +1,28 @@
+# Lets `pipx install git+https://github.com/mitchjablonski/cc-session-restore`
+# and `uv tool install git+...` put `cc-session-restore` on PATH.
+# The tool itself stays one stdlib-only file that also runs directly.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-session-restore"
+version = "0.1.1"
+description = "Reopen all your Claude Code sessions after a restart, in one click."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/mitchjablonski/cc-session-restore"
+
+[tool.setuptools]
+# Install the file as-is into the environment's bin/ (setuptools rewrites only
+# the shebang). No package or module: nothing to import, nothing duplicated.
+script-files = ["cc-session-restore"]
+packages = []
+py-modules = []
