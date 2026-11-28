@@ -802,6 +802,20 @@ def desktop_quote(arg):
     return '"' + arg.replace("%", "%%") + '"'
 
 
+def ephemeral_install(me):
+    """True if `me` runs from a throwaway pipx/uv environment (`uvx`, `pipx run`)."""
+    parts = [p.lower() for p in me.parts]
+    pairs = set(zip(parts, parts[1:]))
+    if any(re.fullmatch(r"(archive|builds)-v\d+", p) for p in parts):
+        return True  # uv cache (uvx): <cache>/archive-v0/<hash>/bin/...
+    venv = (me.parent.parent / "pyvenv.cfg").is_file()  # bin/<script> in a venv
+    if ("pipx", ".cache") in pairs or (".cache", "pipx") in pairs or (
+            venv and me.parent.parent.parent.name == ".cache"):
+        return True  # pipx run: <PIPX_HOME>/.cache/<hash> or ~/.cache/pipx/<hash>
+    # A tool venv inside the temp dir, but not a plain git clone there.
+    return venv and in_temp_dir(str(me))
+
+
 def install():
     """Add a "Claude Code sessions" launcher that opens the picker page."""
     # The launcher runs this file with this interpreter. Under pipx or
@@ -810,16 +824,18 @@ def install():
     # both last until the tool is uninstalled. `pipx run` and `uvx` run from a
     # cache that gets cleaned up, so a launcher made from there would break.
     me = Path(__file__).resolve()
-    if in_temp_dir(str(me)) or {".cache", "archive-v0"} & set(me.parts):
-        die(f"this copy runs from a temporary or cache folder ({me.parent}), so a launcher "
-            "would stop working. Install it first (pipx install / uv tool install, or git clone).")
+    if ephemeral_install(me):
+        die(f"this copy runs from a temporary pipx/uv environment ({me.parent}) that will be "
+            "cleaned up, so a launcher would stop working. Install it with "
+            "`pipx install` or `uv tool install`, then run --install again.")
     python = sys.executable or "python3"
     if IS_WSL:
         # Start menu shortcut -> hidden PowerShell -> hidden wsl.exe -> this script.
         # The PowerShell command is base64-encoded so the shortcut needs no quoting.
         import base64
         if '"' in str(me) + python:
-            die('the folder path contains a double quote, which wsl.exe can\'t take. Move the repo.')
+            die("the script or Python path contains a double quote, which wsl.exe can't take: "
+                f"{me} / {python}. Move it to a folder without one.")
         distro = os.environ["WSL_DISTRO_NAME"]
         wsl_args = f'-d {distro} --cd "{me.parent}" -- "{python}" "./{me.name}" --gui'
         cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '{wsl_args.replace(chr(39), chr(39) * 2)}'"

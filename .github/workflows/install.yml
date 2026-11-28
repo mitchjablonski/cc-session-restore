@@ -63,6 +63,23 @@ jobs:
           head -3 "$target"
           cc-session-restore --help | head -1 | grep -q '^cc-session-restore - reopen'
 
+      - name: Install into a long path (shebang becomes a /bin/sh stub)
+        run: |
+          # Linux limits a shebang to 127 chars; past that, installers write a
+          # /bin/sh trampoline instead, which must still give a working --help.
+          long="$(realpath ..)/long-$(printf 'x%.0s' $(seq 1 120))"
+          if [ "${{ matrix.installer }}" = pipx ]; then
+            PIPX_HOME="$long/pipx" PIPX_BIN_DIR="$long/bin" pipx install --python "$TOOL_PYTHON" ./src
+          else
+            UV_TOOL_DIR="$long/uv" UV_TOOL_BIN_DIR="$long/bin" uv tool install --python "$TOOL_PYTHON" ./src
+          fi
+          target=$(realpath "$long/bin/cc-session-restore")
+          echo "installed at ${#target} chars: $target"
+          head -3 "$target"
+          head -1 "$target" | grep -qx '#!/bin/sh'
+          "$long/bin/cc-session-restore" --help | tee help.txt | head -1
+          head -1 help.txt | grep -q '^cc-session-restore - reopen'
+
       - name: Make fake Claude Code data
         run: |
           project="$(realpath ..)/fake-project"

@@ -27,7 +27,9 @@ cc-session-restore --install
 
 This puts `cc-session-restore` on your PATH. Update with `pipx upgrade cc-session-restore` or `uv tool upgrade cc-session-restore`.
 
-Or clone it and run the file directly (this also works on native Windows):
+**Native Windows:** pipx and uv installs don't run there. The command they add has no `.exe` wrapper, so Windows can't start it. Use the clone below instead.
+
+Or clone it and run the file directly. This works everywhere, including native Windows:
 
 ```bash
 git clone https://github.com/mitchjablonski/cc-session-restore
@@ -35,7 +37,7 @@ cd cc-session-restore
 ./cc-session-restore --install      # Windows: python cc-session-restore --install
 ```
 
-Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher, which keeps working until you uninstall or move the tool (it won't work from a one-off `uvx` or `pipx run`):
+Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher. The launcher runs the script with the exact Python that ran `--install` (for pipx or uv, the tool's own environment), so it keeps working until you uninstall or move the tool or that Python. If you do, run `--install` again. It refuses to run from a one-off `uvx` or `pipx run`, whose environments get cleaned up. Where the launcher goes:
 
 | Where Claude Code runs | Launcher |
 |---|---|
