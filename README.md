@@ -88,6 +88,10 @@ On Linux, xfce4-terminal and WezTerm open each session in a new tab. GNOME Termi
 
 To pick one yourself, use `--terminal NAME` or set `CC_SESSION_RESTORE_TERMINAL`. Run `--help` for the full list of names.
 
+On native Windows, the launcher uses the built-in Windows PowerShell to pass arguments safely to `cmd /k`. The default `claude` command resolves through `PATH`, including npm's `.cmd` shim. An explicit `.ps1` path runs in PowerShell and respects your existing execution policy; use the `.cmd` shim if unsigned scripts are blocked. Extra flags use Windows quoting, for example `--model opus --name="two words"`. Literal double quotes, newlines and NUL characters inside arguments are rejected for `cmd` launchers. Spaces and `&`, `^`, `%`, `!`, `(` and `)` are supported.
+
+Native Windows `--dry-run` prints a command to paste into **PowerShell**, including the original working folder for the console fallback. The encoded portion carries arguments literally; it does not download or run another script. The printed line is safe in both Windows PowerShell 5.1 and PowerShell 7: Windows Terminal tab titles have `"` replaced by `'`, and leading `-` and trailing `\` removed. Known limitation: `cmd` can't start in a UNC folder (`\\server\share`, `\\wsl.localhost\...`), so sessions whose folder is a UNC path open in `C:\Windows` and `--resume` won't find them; map a drive letter instead. See [Windows verification](docs/windows-testing.md) for automated coverage and remaining desktop checks.
+
 ### Settings
 
 | Environment variable | What it does |
@@ -114,7 +118,7 @@ Only sessions you started yourself in a terminal are listed. SDK and background 
 
 - **This depends on Claude Code's internal files.** The session registry and transcript layout aren't a public API and may change in any release. If the list comes up empty or wrong, include the output of `cc-session-restore doctor` in your bug report. It reports the environment, registry field changes and why transcripts were skipped. The default output hides paths, session titles and IDs. Use `doctor --verbose` locally to see paths, titles and unknown field names, and review those details before sharing them.
 - **Pre-checking is a best guess.** It relies on Claude Code cleaning up its own files. Uncheck anything you don't want.
-- **Not every platform is tested yet.** WSL + Windows Terminal and tmux are tested, and the Linux terminal launchers are run on CI (headless, under Xvfb). The macOS and native Windows launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
+- **Not every desktop path is tested yet.** WSL + Windows Terminal and tmux are tested, and the Linux terminal launchers are run on CI (headless, under Xvfb). Native Windows has hidden fake-command, process and shortcut integration checks; interactive Windows Terminal tabs and Start menu activation still need a desktop check. The macOS launchers are built from each terminal's documented command line but haven't been run on real machines yet. Reports and fixes are welcome.
 
 ## Contributing
 
