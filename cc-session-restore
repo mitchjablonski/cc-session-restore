@@ -375,6 +375,11 @@ def applescript_str(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def konsole_quote(text):
+    """Shell "..." quoting that writes every $ as \\$, which Konsole doesn't expand."""
+    return '"' + re.sub(r'([\\"$`])', r"\\\1", text) + '"'
+
+
 def wt(args):
     """Windows Terminal treats ';' as a command separator even inside arguments."""
     return [a.replace(";", "\\;") for a in args]
@@ -419,10 +424,10 @@ def launch_cmd(s, terminal):
     linux = {
         # --opt=value, so a title starting with "-" isn't taken for an option.
         "gnome-terminal": ["gnome-terminal", "--tab", f"--title={title}", f"--working-directory={cwd}", "--", *sh],
-        # Konsole expands $VARS in --workdir and -e arguments, except after a backslash,
-        # so also cd in the shell, with the folder in "..." where $ is written \$.
+        # Konsole expands $VARS in --workdir and -e arguments, so also cd in the shell, and
+        # quote every word with konsole_quote (CLAUDE_ARGS as plain words, as on Windows).
         "konsole": ["konsole", "--new-tab", "--workdir", cwd, "-e", *login_shell(),
-                    'cd "' + re.sub(r'([\\"$`])', r"\\\1", cwd) + '" && ' + inner],
+                    f"cd {konsole_quote(cwd)} && " + " ".join(map(konsole_quote, win_cmd[2:]))],
         "xfce4-terminal": ["xfce4-terminal", "--tab", f"--title={title}", f"--working-directory={cwd}", "-x", *sh],
         "kitty": ["kitty", f"--directory={cwd}", f"--title={title}", *sh],
         "wezterm": (["wezterm", "cli", "spawn", "--cwd", cwd, "--", *sh] if os.environ.get("WEZTERM_PANE")
@@ -835,6 +840,13 @@ def install():
         app.chmod(0o755)
         print(f"Added {app}\n(double-click it, or drag it to the Dock)")
     else:
+        for path in (sys.executable, str(me)):
+            try:
+                path.encode("utf-8")
+            except UnicodeEncodeError:
+                die(f"{path!r} isn't valid UTF-8, which a .desktop file needs. Move it.")
+            if "\n" in path or "\r" in path:
+                die(f"{path!r} contains a line break, which a .desktop file can't hold. Move it.")
         apps = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "applications"
         apps.mkdir(parents=True, exist_ok=True)
         entry = apps / "cc-session-restore.desktop"

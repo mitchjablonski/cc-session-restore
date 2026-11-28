@@ -18,20 +18,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { terminal: gnome-terminal, packages: gnome-terminal, title: check-title }
-          - { terminal: konsole, packages: konsole, title: "" }
-          - { terminal: xfce4-terminal, packages: xfce4-terminal, title: check-title }
-          - { terminal: kitty, packages: kitty, title: check-title }
-          - { terminal: wezterm, packages: wezterm, title: "" }
-          - { terminal: alacritty, packages: alacritty, title: check-title }
-          - { terminal: x-terminal-emulator, packages: xterm, title: check-title }
-          - { terminal: xterm, packages: xterm, title: check-title }
+          # windows: how many the two sessions should end up in (1 = the second became a tab).
+          - { terminal: gnome-terminal, packages: gnome-terminal, title: "1", class: gnome-terminal, windows: 1 }
+          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 1 }
+          - { terminal: xfce4-terminal, packages: xfce4-terminal, title: "1", class: xfce4-terminal, windows: 1 }
+          - { terminal: kitty, packages: kitty, title: "1", class: kitty, windows: 2 }
+          - { terminal: wezterm, packages: wezterm, title: "", class: "", windows: "" }  # checked with `wezterm cli list`
+          - { terminal: alacritty, packages: alacritty, title: "1", class: alacritty, windows: 2 }
+          - { terminal: x-terminal-emulator, packages: xterm, title: "1", class: xterm, windows: 2 }
+          - { terminal: xterm, packages: xterm, title: "1", class: xterm, windows: 2 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Add the wezterm apt repository
         if: matrix.terminal == 'wezterm'
         run: |
-          curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg
+          # wezterm doesn't publish this key's fingerprint; this is the one apt.fury.io/wez
+          # served when this workflow was written (Wez Furlong <gemfury@wez.wezfurlong.org>).
+          expected=0CA603116C960BAFB2BF310BD7BA31CF90C4B319
+          curl -fsSL https://apt.fury.io/wez/gpg.key -o wezterm.key
+          got=$(gpg --show-keys --with-colons wezterm.key | awk -F: '$1 == "fpr" { print $10; exit }')
+          [ "$got" = "$expected" ] || { echo "wezterm apt key fingerprint is $got, expected $expected"; exit 1; }
+          sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg wezterm.key
           echo 'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list
       - name: Install ${{ matrix.packages }}
         run: |
@@ -41,13 +50,18 @@ jobs:
       - name: Launch two sessions
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- bash tests/linux_terminals.sh "${{ matrix.terminal }}" "${{ matrix.title }}"
+          CHECK_TITLE: ${{ matrix.title }}
+          WM_CLASS: ${{ matrix.class }}
+          WINDOWS: ${{ matrix.windows }}
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- bash tests/linux_terminals.sh "${{ matrix.terminal }}"
 
   desktop-file:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install desktop-file-utils and gio
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends desktop-file-utils libglib2.0-bin python3-venv
       - name: --install from a folder with awkward characters, validate, launch with gio
@@ -86,3 +100,15 @@ jobs:
           assert argv == [weird + "/cc-session-restore", "--gui"], argv
           print("ok: the launcher runs", argv)
           EOF
+      - name: --install refuses paths a .desktop file can't hold
+        run: |
+          set -uo pipefail
+          for dir in "$HOME/line
+          break" "$HOME/$(printf 'bad\xff')"; do
+            mkdir -p "$dir" && cp cc-session-restore "$dir/"
+            msg=$(XDG_DATA_HOME="$HOME/xdg2" python3 "$dir/cc-session-restore" --install 2>&1)
+            status=$?
+            echo "$msg"
+            [ "$status" = 1 ] && [[ "$msg" == "cc-session-restore: "*"Move it." ]] || exit 1
+            [ ! -e "$HOME/xdg2" ] || exit 1
+          done
