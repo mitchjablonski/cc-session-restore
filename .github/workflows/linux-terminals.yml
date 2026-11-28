@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   terminal:
-    name: ${{ matrix.terminal }}
+    name: ${{ matrix.terminal }}${{ matrix.konsole_single && ' (single process)' || '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -20,7 +20,8 @@ jobs:
         include:
           # windows: how many the two sessions should end up in (1 = the second became a tab).
           - { terminal: gnome-terminal, packages: gnome-terminal, title: "1", class: gnome-terminal, windows: 1 }
-          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 1 }
+          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 2 }
+          - { terminal: konsole, packages: konsole, title: "", class: konsole, windows: 1, konsole_single: "1" }
           - { terminal: xfce4-terminal, packages: xfce4-terminal, title: "1", class: xfce4-terminal, windows: 1 }
           - { terminal: kitty, packages: kitty, title: "1", class: kitty, windows: 2 }
           - { terminal: wezterm, packages: wezterm, title: "", class: "", windows: "" }  # checked with `wezterm cli list`
@@ -53,6 +54,7 @@ jobs:
           CHECK_TITLE: ${{ matrix.title }}
           WM_CLASS: ${{ matrix.class }}
           WINDOWS: ${{ matrix.windows }}
+          KONSOLE_SINGLE: ${{ matrix.konsole_single }}
         # A window manager, so windows get focus as on a desktop: --tab/--new-tab add
         # the tab to the focused window, and open a new one if nothing has focus.
         run: |

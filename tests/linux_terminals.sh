@@ -9,6 +9,7 @@
 #   CHECK_TITLE=1     check that the window is titled after the newest session
 #   WM_CLASS=regex    count the terminal's windows by X class after both sessions...
 #   WINDOWS=n         ...and expect n of them (1 = the second session went into a tab)
+#   KONSOLE_SINGLE=1  turn on Konsole's "Run all Konsole windows in a single process"
 set -euo pipefail
 term=$1
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,7 +26,7 @@ mkdir -p "$out" "$bin" "$work/config/projects/p" "$proj"
 cat > "$bin/claude" <<EOF
 #!/bin/sh
 { pwd -P; for a in "\$@"; do printf '%s\n' "\$a"; done; } > "$out/\$2.tmp"
-env | grep -E '^(GNOME_TERMINAL_SCREEN|KONSOLE_DBUS_(WINDOW|SESSION)|WEZTERM_PANE|KITTY_WINDOW_ID|WINDOWID)=' > "$out/\$2.env" || true
+env | grep -E '^(GNOME_TERMINAL_(SCREEN|SERVICE)|KONSOLE_DBUS_(WINDOW|SESSION)|WEZTERM_PANE|KITTY_WINDOW_ID|WINDOWID)=' > "$out/\$2.env" || true
 mv "$out/\$2.tmp" "$out/\$2.txt"
 sleep 20
 EOF
@@ -40,6 +41,11 @@ for sid, title in titles.items():
         f.write(json.dumps({"cwd": cwd, "entrypoint": "cli", "type": "user"}) + "\n")
         f.write(json.dumps({"type": "custom-title", "customTitle": title}) + "\n")
 EOF
+
+if [ -n "${KONSOLE_SINGLE:-}" ]; then
+    mkdir -p "$HOME/.config"
+    printf '[KonsoleWindow]\nUseSingleInstance=true\n' >> "$HOME/.config/konsolerc"
+fi
 
 export CLAUDE_CONFIG_DIR="$work/config"
 export CC_SESSION_RESTORE_CLAUDE_BIN="$bin/claude"
@@ -88,11 +94,11 @@ check s1 "-dash title one"
 
 # Second session while the first is still open: tab-capable terminals add a tab
 # to the running instance (wezterm: `cli spawn`, as when run from inside wezterm).
-# gnome-terminal opens --tab next to the terminal in GNOME_TERMINAL_SCREEN, which
-# is set when you run cc-session-restore from inside gnome-terminal.
+# gnome-terminal only adds --tab to an existing window when GNOME_TERMINAL_SERVICE
+# and GNOME_TERMINAL_SCREEN are set, i.e. when run from inside gnome-terminal.
 case $term in
     wezterm) export WEZTERM_PANE=0 ;;
-    gnome-terminal) export "$(grep ^GNOME_TERMINAL_SCREEN= "$out/s1.env")" ;;
+    gnome-terminal) while read -r v; do export "$v"; done < <(grep ^GNOME_TERMINAL_ "$out/s1.env") ;;
 esac
 echo "+ $("$repo/cc-session-restore" --dry-run --terminal "$term" --open s2)"
 "$repo/cc-session-restore" --terminal "$term" --open s2
