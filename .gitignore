@@ -3,3 +3,5 @@
 .deeppairing/
 *.lnk
 __pycache__/
+build/
+*.egg-info/

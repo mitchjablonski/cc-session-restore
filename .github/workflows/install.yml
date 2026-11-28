@@ -1,0 +1,93 @@
+# Installs the checkout with pipx and with `uv tool install`, the way the
+# README's git+https commands do, and runs the installed command against fake
+# Claude Code data. Nothing is launched: only `list --json` and `--dry-run`.
+name: install
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.installer }} (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        installer: [pipx, uv]
+        python: ["3.8", "3.13"]
+    env:
+      PIPX_HOME: ${{ github.workspace }}/../tool-home/pipx
+      PIPX_BIN_DIR: ${{ github.workspace }}/../tool-home/bin
+      UV_TOOL_DIR: ${{ github.workspace }}/../tool-home/uv
+      UV_TOOL_BIN_DIR: ${{ github.workspace }}/../tool-home/bin
+      CLAUDE_CONFIG_DIR: ${{ github.workspace }}/../fake-claude
+      CC_SESSION_RESTORE_CLAUDE_BIN: /bin/false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: src
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+
+      - name: Install a Python ${{ matrix.python }} for the tool venv
+        run: |
+          uv python install "${{ matrix.python }}"
+          echo "TOOL_PYTHON=$(uv python find '${{ matrix.python }}')" >> "$GITHUB_ENV"
+
+      - name: Install with pipx
+        if: matrix.installer == 'pipx'
+        run: pipx install --python "$TOOL_PYTHON" ./src
+
+      - name: Install with uv
+        if: matrix.installer == 'uv'
+        run: uv tool install --python "$TOOL_PYTHON" ./src
+
+      - name: Check the command is on PATH and runs from the tool venv
+        run: |
+          echo "$(realpath ../tool-home/bin)" >> "$GITHUB_PATH"
+          export PATH="$(realpath ../tool-home/bin):$PATH"
+          command -v cc-session-restore
+          target=$(realpath "$(command -v cc-session-restore)")
+          echo "resolves to $target"
+          case "$target" in "$(realpath ../tool-home)"/*) ;; *) echo "not in the tool venv"; exit 1 ;; esac
+          head -3 "$target"
+          cc-session-restore --help | head -1 | grep -q '^cc-session-restore - reopen'
+
+      - name: Make fake Claude Code data
+        run: |
+          project="$(realpath ..)/fake-project"
+          mkdir -p "$project" "$CLAUDE_CONFIG_DIR/projects/fake-project" "$CLAUDE_CONFIG_DIR/sessions"
+          sid=11111111-2222-3333-4444-555555555555
+          printf '{"type":"user","cwd":"%s","entrypoint":"cli","sessionId":"%s"}\n{"type":"custom-title","customTitle":"Fake session"}\n' \
+            "$project" "$sid" > "$CLAUDE_CONFIG_DIR/projects/fake-project/$sid.jsonl"
+          now_ms=$(( $(date +%s) * 1000 ))
+          # A leftover registry file for a process that no longer exists:
+          # the session counts as open when the machine went down.
+          printf '{"pid":999999,"sessionId":"%s","cwd":"%s","startedAt":%s,"updatedAt":%s,"kind":"interactive","entrypoint":"cli"}\n' \
+            "$sid" "$project" "$now_ms" "$now_ms" > "$CLAUDE_CONFIG_DIR/sessions/999999.json"
+
+      - name: list --json
+        run: |
+          cc-session-restore list --json | tee out.json
+          python3 - <<'EOF'
+          import json
+          data = json.load(open("out.json"))
+          fake = [s for s in data["sessions"] if s["title"] == "Fake session"]
+          assert fake and fake[0]["checked"], data
+          EOF
+
+      - name: -y --dry-run --terminal tmux
+        run: |
+          cc-session-restore -y --dry-run --terminal tmux | tee out.txt
+          grep -q '^tmux new-window' out.txt
+          grep -q '11111111-2222-3333-4444-555555555555' out.txt

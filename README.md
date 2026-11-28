@@ -15,13 +15,27 @@ Works on **macOS**, **Linux**, **Windows**, and **WSL** (Claude Code in WSL, ope
 
 ## Install
 
+With [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), straight from GitHub (macOS, Linux, WSL):
+
+```bash
+pipx install git+https://github.com/mitchjablonski/cc-session-restore
+# or
+uv tool install git+https://github.com/mitchjablonski/cc-session-restore
+
+cc-session-restore --install
+```
+
+This puts `cc-session-restore` on your PATH. Update with `pipx upgrade cc-session-restore` or `uv tool upgrade cc-session-restore`.
+
+Or clone it and run the file directly (this also works on native Windows):
+
 ```bash
 git clone https://github.com/mitchjablonski/cc-session-restore
 cd cc-session-restore
 ./cc-session-restore --install      # Windows: python cc-session-restore --install
 ```
 
-Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher:
+Run it with the same Python, on the same side (Windows or WSL), as your Claude Code install. `--install` adds a **Claude Code sessions** launcher, which keeps working until you uninstall or move the tool (it won't work from a one-off `uvx` or `pipx run`):
 
 | Where Claude Code runs | Launcher |
 |---|---|
@@ -32,7 +46,7 @@ Run it with the same Python, on the same side (Windows or WSL), as your Claude C
 
 To have the picker open automatically when you log in, copy that launcher into your startup items. On Windows, that's the `shell:startup` folder.
 
-It's also handy on your PATH: `ln -s "$PWD/cc-session-restore" ~/.local/bin/`
+If you cloned it, it's also handy on your PATH: `ln -s "$PWD/cc-session-restore" ~/.local/bin/`
 
 ## Use
 

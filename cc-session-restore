@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cc-session-restore - reopen your Claude Code sessions after a restart.
+__doc__ = """cc-session-restore - reopen your Claude Code sessions after a restart.
 
 Unofficial; not affiliated with Anthropic. Works on macOS, Linux, Windows and WSL.
 
@@ -804,15 +804,24 @@ def desktop_quote(arg):
 
 def install():
     """Add a "Claude Code sessions" launcher that opens the picker page."""
+    # The launcher runs this file with this interpreter. Under pipx or
+    # `uv tool install` these are the tool venv's bin/cc-session-restore (the
+    # PATH entry is a symlink to it, which resolve() follows) and its python;
+    # both last until the tool is uninstalled. `pipx run` and `uvx` run from a
+    # cache that gets cleaned up, so a launcher made from there would break.
     me = Path(__file__).resolve()
+    if in_temp_dir(str(me)) or {".cache", "archive-v0"} & set(me.parts):
+        die(f"this copy runs from a temporary or cache folder ({me.parent}), so a launcher "
+            "would stop working. Install it first (pipx install / uv tool install, or git clone).")
+    python = sys.executable or "python3"
     if IS_WSL:
         # Start menu shortcut -> hidden PowerShell -> hidden wsl.exe -> this script.
         # The PowerShell command is base64-encoded so the shortcut needs no quoting.
         import base64
-        if '"' in str(me):
+        if '"' in str(me) + python:
             die('the folder path contains a double quote, which wsl.exe can\'t take. Move the repo.')
         distro = os.environ["WSL_DISTRO_NAME"]
-        wsl_args = f'-d {distro} --cd "{me.parent}" -- python3 "./{me.name}" --gui'
+        wsl_args = f'-d {distro} --cd "{me.parent}" -- "{python}" "./{me.name}" --gui'
         cmd = f"Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '{wsl_args.replace(chr(39), chr(39) * 2)}'"
         enc = base64.b64encode(cmd.encode("utf-16-le")).decode()
         windows_shortcut("powershell.exe", "powershell.exe",
