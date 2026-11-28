@@ -14,7 +14,9 @@ only where synthetic working folders need it. No real Claude configuration is re
 
 The smoke test starts the CLI with `CLAUDE_CONFIG_DIR` pointing to the fixture,
 checks `list --json`, and checks `-y --dry-run` using a fake Claude binary. Its
-working folder is the repository, so normal temporary-folder filtering remains
-enabled. No terminal windows, browsers, or Claude processes are launched.
+working folder is a unique temporary directory under the real user's home, so
+normal temporary-folder filtering remains enabled even for checkouts under
+`/tmp`. That folder and the separate temporary config are cleaned up on exit.
+No terminal windows, browsers, or Claude processes are launched.
 
 CI runs these commands on Linux, macOS and Windows with Python 3.8 and 3.13.

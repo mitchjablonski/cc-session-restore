@@ -39,6 +39,14 @@ class DiscoveryTests(unittest.TestCase):
         found = {s["id"]: s["title"] for s in self.app.recent_sessions()}
         self.assertEqual(found, {row[0]: row[-1] for row in cases})
 
+    def test_latest_ai_title_is_read_from_large_transcript_tail(self):
+        path = self.fx.transcript("large", NOW, [
+            {"type": "ai-title", "aiTitle": "Earlier AI"},
+            {"type": "assistant", "text": "x" * (self.app.TAIL_BYTES + self.app.CHUNK)},
+            {"type": "ai-title", "aiTitle": "Latest tail AI"}])
+        self.assertGreater(path.stat().st_size, self.app.CHUNK + self.app.TAIL_BYTES)
+        self.assertEqual(self.app.recent_sessions()[0]["title"], "Latest tail AI")
+
     def test_noninteractive_and_missing_folders_skipped(self):
         self.fx.transcript("sdk", NOW, entrypoint="sdk")
         self.fx.transcript("background", NOW, entrypoint="background")
@@ -67,6 +75,7 @@ class DiscoveryTests(unittest.TestCase):
         found = {s["id"]: s for s in self.app.recent_sessions()}
         self.assertTrue(found["boundary"]["was_open"])
         self.assertFalse(found["reused"]["was_open"])
+        self.assertEqual(self.app.precheck(list(found.values())), {"boundary"})
 
     def test_precheck_seven_day_boundary(self):
         rows = [self.row("new", NOW), self.row("edge", NOW - 7 * DAY),

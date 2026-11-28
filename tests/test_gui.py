@@ -2,30 +2,19 @@
 import concurrent.futures
 import contextlib
 import http.client
-import importlib.machinery
-import importlib.util
 import json
-from pathlib import Path
 import queue
 import socket
 import threading
 import unittest
 from unittest import mock
 from urllib.parse import urlsplit
-
-
-def load_script():
-    loader = importlib.machinery.SourceFileLoader(
-        "restore_gui", str(Path(__file__).resolve().parents[1] / "cc-session-restore"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+from fixtures import load_app
 
 
 class GuiTests(unittest.TestCase):
     def setUp(self):
-        self.app = load_script()
+        self.app = load_app()
         self.urls = queue.Queue()
         self.errors = queue.Queue()
         self.release = threading.Event()
@@ -92,6 +81,7 @@ class GuiTests(unittest.TestCase):
         cookie = self.authenticate()
         self.assertEqual(self.request("/?" + self.url.query)[0], 403)
         self.assertEqual(self.request("/api/sessions")[0], 403)
+        self.assertEqual(self.request("/api/open", "POST", body="{}")[0], 403)
         self.assertEqual(self.request("/api/sessions", cookie="ccsr=wrong")[0], 403)
         self.assertEqual(self.request("/api/sessions", cookie=cookie, host="attacker.invalid")[0], 403)
         self.assertEqual(self.request("/api/open", "POST", cookie, "attacker.invalid", "{}")[0], 403)
@@ -144,7 +134,11 @@ class GuiTests(unittest.TestCase):
             occupied.listen(1)
             port = occupied.getsockname()[1]
             with self.assertRaises(SystemExit) as error:
-                self.app.main(["--gui", "--no-browser", "--port", str(port)])
+                # Bound the test even if a platform unexpectedly permits the bind.
+                run_gui = self.app.run_gui
+                with mock.patch.object(self.app, "run_gui", side_effect=lambda *a, **kw:
+                                       run_gui(*a, idle_timeout=0.1, **kw)):
+                    self.app.main(["--gui", "--no-browser", "--port", str(port)])
         self.assertIn("can't listen on port {}".format(port), str(error.exception))
         self.assertIn("--port", str(error.exception))
 

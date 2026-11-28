@@ -1,23 +1,12 @@
 """Launch command construction only: never open a terminal or run Claude."""
-import importlib.machinery
-import importlib.util
 import os
-from pathlib import Path
 import shlex
 import unittest
 from unittest import mock
+from fixtures import load_app
 
 
-def load_script():
-    loader = importlib.machinery.SourceFileLoader(
-        "restore_launch_tests", str(Path(__file__).resolve().parents[1] / "cc-session-restore"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-restore = load_script()
+restore = load_app()
 
 
 class LaunchCommandTests(unittest.TestCase):

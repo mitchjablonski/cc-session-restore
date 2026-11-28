@@ -1,16 +1,17 @@
 """Exercise the actual CLI with fake data and command printing only."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 from fixtures import Fixture, ROOT
 
 
-def main():
-    # The repository is a real working folder, outside the OS temporary tree.
-    fx = Fixture(cwd=ROOT)
+def run_smoke(cwd):
+    fx = Fixture(cwd=cwd)
     try:
         now = time.time()
         fx.transcript("smoke-session", now, [{"type": "custom-title", "customTitle": "Synthetic smoke"}])
@@ -35,6 +36,13 @@ def main():
         print("CLI JSON discovery and dry-run passed with synthetic data and fake Claude binary.")
     finally:
         fx.close()
+
+
+def main():
+    # A checkout may itself live under /tmp. Keep normal discovery filtering
+    # enabled while using a unique synthetic working folder under the real home.
+    with tempfile.TemporaryDirectory(prefix="cc-session-restore-smoke-", dir=str(Path.home())) as cwd:
+        run_smoke(cwd)
 
 
 if __name__ == "__main__":
