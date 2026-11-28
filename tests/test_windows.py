@@ -193,7 +193,7 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(script.startswith("Set-Location -LiteralPath " + restore.ps_literal(self.folder) + ";"))
         assert_no_raw(self, script, [str(self.folder), self.session["id"]])
         self.assertIn("/d /v:off /s /k", script)
-        self.assertIn(self.session["id"], script)
+        self.assertIn(self.session["id"], ps_values(script)[0])
 
     def test_windows_terminal_bootstrap_runs_in_original_folder(self):
         with mock.patch.object(restore, "CLAUDE_BIN", str(self.shim)), \
@@ -412,6 +412,7 @@ class PortableStringTests(unittest.TestCase):
         values, _ = ps_values(ps)
         self.assertEqual(values[:4], [folder + "\\x.lnk", folder + "\\python.exe", '"a" ' + HOSTILE, folder])
 
+    @unittest.skipIf(os.name == "nt", "builds a POSIX clone path")
     def test_wsl_install_encodes_the_clone_path(self):
         me = "/home/me/x" + HOSTILE + "/cc-session-restore"
         with mock.patch.object(restore, "IS_WSL", True), \

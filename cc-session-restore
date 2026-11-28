@@ -73,6 +73,11 @@ SUPPORTED_TERMINALS = frozenset(LINUX_TERMINALS) | {
 IS_WINDOWS = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 IS_WSL = bool(os.environ.get("WSL_DISTRO_NAME"))
+if IS_WINDOWS:
+    # Redirected output uses the ANSI code page; don't crash on a title outside it.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
 SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,127}$")
 TEMP_DIRS = {os.path.normcase(p) for p in
              (str(Path(tempfile.gettempdir()).resolve()), "/tmp", "/private/tmp", "/var/folders")}
