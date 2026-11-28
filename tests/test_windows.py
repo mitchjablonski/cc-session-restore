@@ -103,7 +103,7 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(kw.pop("console"))
         self.assertEqual(kw.pop("creationflags"), subprocess.CREATE_NEW_CONSOLE)
         result = self.captured(self.run_hidden(argv, **kw))
-        self.assertEqual(os.path.normcase(result["cwd"]), os.path.normcase(str(self.folder)))
+        self.assertTrue(os.path.samefile(result["cwd"], self.folder))
         self.assertEqual(result["args"], ["--resume", self.session["id"], "--name=two words", "", "a&b^%!()"])
 
     def test_path_resolves_npm_style_cmd_shim(self):
@@ -139,7 +139,7 @@ class WindowsTests(unittest.TestCase):
             popen.assert_not_called()
         result = self.captured(self.run_hidden(["powershell.exe", "-NoProfile", "-Command", lines[0]]))
         self.assertEqual(result["args"], ["--resume", self.session["id"]])
-        self.assertEqual(os.path.normcase(result["cwd"]), os.path.normcase(str(self.folder)))
+        self.assertTrue(os.path.samefile(result["cwd"], self.folder))
 
     def test_windows_terminal_keeps_data_out_of_command_syntax(self):
         with mock.patch.object(restore, "CLAUDE_BIN", str(self.shim)), \
