@@ -155,6 +155,49 @@ class GuiSecurityTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.launched, ["sess-1"])
 
+    def test_replayed_cookie_cannot_get_secret(self):
+        # A hostile local server that received the cookie replays it to load the page.
+        status, _, body = self.request("GET", "/", headers={"Cookie": self.cookie})
+        self.assertEqual(status, 200)  # a reload in the same tab still loads the page...
+        self.assertNotIn(self.token, body)  # ...but without the secret
+        m = re.search(r'<meta name="ccsr-token" content="([^"]*)">', body)
+        self.assertIsNotNone(m)
+        stolen = m.group(1)
+        self.assertEqual(stolen, "")
+        h = {"Cookie": self.cookie, "X-CCSR-Token": stolen, "Content-Type": "application/json"}
+        self.assertEqual(self.open_ids(h)[0], 403)
+        self.assertEqual(self.request("GET", "/api/sessions", headers=h)[0], 403)
+        self.assertEqual(self.launched, [])
+
+    def test_page_js_reads_secret_from_session_storage_on_reload(self):
+        self.assertIn('sessionStorage.setItem("ccsr-token", t)', ccsr.PAGE)
+        self.assertIn('sessionStorage.getItem("ccsr-token")', ccsr.PAGE)
+
+    def test_frame_headers_on_every_response(self):
+        responses = [
+            self.request("GET", "/", headers={"Cookie": self.cookie}),
+            self.request("GET", "/"),  # 403, no cookie
+            self.request("GET", "/api/sessions", headers=self.good_headers()),
+            self.request("GET", "/nope", headers=self.good_headers()),
+            self.open_ids(self.good_headers(Origin="http://evil.example")),
+        ]
+        for status, headers, _ in responses:
+            self.assertEqual(headers["X-Frame-Options"], "DENY", status)
+            self.assertEqual(headers["Content-Security-Policy"], "frame-ancestors 'none'", status)
+
+    def test_non_ascii_secrets_get_403(self):
+        cases = [
+            ("GET", "/api/sessions", {"Cookie": "ccsr=\u00e9", "X-CCSR-Token": self.token}),
+            ("GET", "/api/sessions", {"Cookie": self.cookie, "X-CCSR-Token": "\u00e9"}),
+            ("POST", "/api/open", self.good_headers(Cookie="ccsr=\u00e9")),
+            ("GET", "/?t=%C3%A9", {}),
+            ("GET", "/", {"Cookie": "ccsr=\u00e9"}),
+        ]
+        for method, path, headers in cases:
+            body = json.dumps({"ids": ["sess-1"]}) if method == "POST" else None
+            self.assertEqual(self.request(method, path, body, headers)[0], 403, (path, headers))
+        self.assertEqual(self.launched, [])
+
     def test_page_js_sends_token_on_every_fetch(self):
         fetches = re.findall(r"fetch\((.*?)\);", ccsr.PAGE, re.S)
         self.assertEqual(len(fetches), 2)

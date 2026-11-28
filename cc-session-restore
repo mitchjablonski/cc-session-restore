@@ -562,8 +562,16 @@ button.primary:disabled { opacity:.45; cursor:default; }
 <script>
 let n = null, rows = [], checked = new Set(), known = new Set(), busy = false;
 const $ = id => document.getElementById(id);
-// Per-run secret embedded by the server; every /api call must send it back.
-const TOKEN = document.querySelector('meta[name="ccsr-token"]').content;
+// Per-run secret every /api call must send back. The server embeds it only in the
+// first (one-time link) load; keep it in sessionStorage, which is per-tab and
+// per-origin (so per-port), for reloads of this tab.
+const TOKEN = (() => {
+  const t = document.querySelector('meta[name="ccsr-token"]').content;
+  try {
+    if (t) sessionStorage.setItem("ccsr-token", t);
+    return t || sessionStorage.getItem("ccsr-token") || "";
+  } catch (e) { return t; }
+})();
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function toggle(id) { checked.has(id) ? checked.delete(id) : checked.add(id); render(id); }
@@ -680,12 +688,20 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
 
     # The URL carries a one-time token (it may be visible in the browser's command
     # line); the first page load swaps it for a cookie that the API then requires.
-    # Cookies aren't isolated by port, so a page on another local port the browser
-    # visits could receive that cookie. The API also requires a second secret in an
-    # X-CCSR-Token header: it is only embedded in the page, which other origins can't read.
+    # Cookies aren't isolated by port, so a server on another local port that the
+    # browser visits receives that cookie and could replay it. So the API also needs a
+    # second secret in an X-CCSR-Token header. It is embedded only in the response to
+    # the one-time link (the page keeps it in per-origin sessionStorage for reloads);
+    # loading the page with just the cookie serves it without the secret.
     url_token, cookie, api_token = (secrets.token_urlsafe(18), secrets.token_urlsafe(24),
                                     secrets.token_urlsafe(24))
-    page = PAGE.replace("__CCSR_TOKEN__", api_token)
+    first_page = PAGE.replace("__CCSR_TOKEN__", api_token)
+    later_page = PAGE.replace("__CCSR_TOKEN__", "")
+
+    def same(a, b):
+        # compare_digest raises on non-ASCII str; compare bytes so odd input is just "no".
+        return secrets.compare_digest(a.encode("utf-8", "surrogateescape"),
+                                      b.encode("utf-8", "surrogateescape"))
     state = {"done": False, "opening": False, "url_used": False, "last": time.time()}
     lock = threading.Lock()
 
@@ -700,6 +716,8 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")  # no clickjacking via a frame
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
@@ -717,12 +735,12 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
         def api_ok(self):
             token = self.headers.get("X-CCSR-Token") or ""
             return (self.host_ok() and self.origin_ok() and self.has_cookie()
-                    and secrets.compare_digest(token.encode("utf-8"), api_token.encode("utf-8")))
+                    and same(token, api_token))
 
         def has_cookie(self):
             for part in (self.headers.get("Cookie") or "").split(";"):
                 k, _, v = part.strip().partition("=")
-                if k == "ccsr" and secrets.compare_digest(v, cookie):
+                if k == "ccsr" and same(v, cookie):
                     return True
             return False
 
@@ -734,16 +752,16 @@ def run_gui(count, terminal, browser=True, port=0, idle_timeout=900):
             if u.path == "/":
                 t = q.get("t", [""])[0]
                 with lock:
-                    fresh = bool(t) and not state["url_used"] and secrets.compare_digest(t, url_token)
+                    fresh = bool(t) and not state["url_used"] and same(t, url_token)
                     if fresh:
                         state["url_used"] = True
                 if fresh:
                     state["last"] = time.time()
-                    return self.send(200, page, "text/html", [(
+                    return self.send(200, first_page, "text/html", [(
                         "Set-Cookie", f"ccsr={cookie}; Path=/; HttpOnly; SameSite=Strict")])
                 if self.has_cookie():
                     state["last"] = time.time()
-                    return self.send(200, page, "text/html")
+                    return self.send(200, later_page, "text/html")
                 return self.send(403, "This link has already been used. Run cc-session-restore --gui again.",
                                  "text/plain")
             if not self.api_ok():
