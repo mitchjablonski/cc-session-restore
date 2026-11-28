@@ -711,7 +711,7 @@ def launch_cmd(s, terminal):
         # Konsole expands $VARS in --workdir and -e arguments, so also cd in the shell, and
         # quote every word with konsole_quote (CLAUDE_ARGS as plain words, as on Windows).
         "konsole": ["konsole", "--new-tab", "--workdir", cwd, "-e", *login_shell(),
-                    f"cd {konsole_quote(cwd)} && " + " ".join(map(konsole_quote, win_cmd[2:]))],
+                    f"cd {konsole_quote(cwd)} && " + " ".join(map(konsole_quote, [CLAUDE_BIN, "--resume", s["id"], *shlex.split(CLAUDE_ARGS)]))],
         "xfce4-terminal": ["xfce4-terminal", "--tab", f"--title={title}", f"--working-directory={cwd}", "-x", *sh],
         "kitty": ["kitty", f"--directory={cwd}", f"--title={title}", *sh],
         "wezterm": (["wezterm", "cli", "spawn", "--cwd", cwd, "--", *sh] if os.environ.get("WEZTERM_PANE")

@@ -191,9 +191,13 @@ class WindowsTests(unittest.TestCase):
         self.assertGreater(boot, 0)
 
     def test_real_shortcut_readback_in_temporary_folder(self):
-        shortcut = self.folder / "test sessions.lnk"
+        # WScript.Shell can't save shortcuts outside the ANSI code page, so this
+        # folder keeps the shell metacharacters but not the non-ASCII part.
+        folder = Path(self.temp.name) / "space & caret^ %CCSR_TEST_EXPAND% ! (x) '"
+        folder.mkdir()
+        shortcut = folder / "test sessions.lnk"
         arguments = subprocess.list2cmdline([str(SCRIPT), "--gui"])
-        restore.windows_shortcut("powershell.exe", sys.executable, arguments, self.folder, shortcut)
+        restore.windows_shortcut("powershell.exe", sys.executable, arguments, folder, shortcut)
         q = "'" + str(shortcut).replace("'", "''") + "'"
         result = self.run_hidden(["powershell.exe", "-NoProfile", "-Command",
                                   "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
@@ -204,7 +208,7 @@ class WindowsTests(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual(data["TargetPath"].lower(), sys.executable.lower())
         self.assertEqual(data["Arguments"], arguments)
-        self.assertEqual(data["WorkingDirectory"], str(self.folder))
+        self.assertEqual(data["WorkingDirectory"], str(folder))
         self.assertEqual(data["WindowStyle"], 7)
 
     def test_install_selects_pythonw_with_console_fallback(self):
